@@ -6,6 +6,13 @@ import requests
 from datetime import datetime
 import math
 
+try:
+    import FinanceDataReader as fdr
+    FDR_AVAILABLE = True
+except Exception:
+    FDR_AVAILABLE = False
+
+
 app = FastAPI(title="Alpharion Market Watch API")
 
 app.add_middleware(
@@ -15,6 +22,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 KOREAN_NAME_MAP = {
     "삼성전자": "005930.KS",
@@ -34,7 +42,10 @@ KOREAN_NAME_MAP = {
     "한화오션": "042660.KS",
     "현대로템": "064350.KS",
     "한화에어로스페이스": "012450.KS",
+    "산일전기": "062040.KS",
 }
+
+KRX_CACHE = None
 
 
 @app.get("/")
@@ -61,6 +72,7 @@ def search_stock(q: str = Query("")):
     results = []
     seen = set()
 
+    # 1. 주요 국내 종목 직접 매칭
     for name, symbol in KOREAN_NAME_MAP.items():
         if q.lower() in name.lower() or q.lower() in symbol.lower():
             results.append({
@@ -71,6 +83,15 @@ def search_stock(q: str = Query("")):
             })
             seen.add(symbol)
 
+    # 2. KRX 전체 종목명 검색
+    krx_results = search_krx_by_name(q)
+    for item in krx_results:
+        symbol = item["symbol"]
+        if symbol not in seen:
+            results.append(item)
+            seen.add(symbol)
+
+    # 3. 6자리 숫자 코드 입력 시
     if q.isdigit() and len(q) == 6:
         for suffix, market in [(".KS", "Korea"), (".KQ", "Korea KOSDAQ")]:
             symbol = q + suffix
@@ -83,37 +104,15 @@ def search_stock(q: str = Query("")):
                 })
                 seen.add(symbol)
 
-    try:
-        url = "https://query1.finance.yahoo.com/v1/finance/search"
-        params = {
-            "q": q,
-            "quotesCount": 20,
-            "newsCount": 0,
-            "enableFuzzyQuery": "true"
-        }
-        headers = {"User-Agent": "Mozilla/5.0"}
+    # 4. Yahoo 전세계 검색
+    yahoo_results = yahoo_search(q)
+    for item in yahoo_results:
+        symbol = item.get("symbol")
+        if symbol and symbol not in seen:
+            results.append(item)
+            seen.add(symbol)
 
-        res = requests.get(url, params=params, headers=headers, timeout=8)
-        data = res.json()
-
-        for item in data.get("quotes", []):
-            symbol = item.get("symbol")
-            name = item.get("shortname") or item.get("longname") or item.get("name")
-            exchange = item.get("exchange") or item.get("exchDisp") or "Unknown"
-            quote_type = item.get("quoteType", "")
-
-            if symbol and symbol not in seen:
-                results.append({
-                    "name": name or symbol,
-                    "symbol": symbol,
-                    "market": exchange,
-                    "type": quote_type
-                })
-                seen.add(symbol)
-
-    except Exception:
-        pass
-
+    # 5. 직접 티커 fallback
     if not results:
         guessed = normalize_symbol(q)
         results.append({
@@ -135,8 +134,16 @@ def get_stock(symbol: str, period: str = "1y"):
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period=period, interval="1d")
 
+        # .KS 실패 시 .KQ 재시도
+        if hist.empty and symbol.endswith(".KS"):
+            alt_symbol = symbol.replace(".KS", ".KQ")
+            ticker = yf.Ticker(alt_symbol)
+            hist = ticker.history(period=period, interval="1d")
+            if not hist.empty:
+                symbol = alt_symbol
+
         if hist.empty:
-            return {"error": "No data found"}
+            return {"error": f"No data found for {symbol}"}
 
         hist = hist.dropna()
 
@@ -215,6 +222,105 @@ def get_stock(symbol: str, period: str = "1y"):
         return {"error": str(e)}
 
 
+def get_krx_stocks():
+    global KRX_CACHE
+
+    if KRX_CACHE is not None:
+        return KRX_CACHE
+
+    stocks = []
+
+    if not FDR_AVAILABLE:
+        KRX_CACHE = stocks
+        return stocks
+
+    try:
+        df = fdr.StockListing("KRX")
+
+        for _, row in df.iterrows():
+            name = str(row.get("Name", "")).strip()
+            code = str(row.get("Code", "")).strip()
+            market = str(row.get("Market", "")).strip()
+
+            if not name or not code:
+                continue
+
+            if market == "KOSDAQ":
+                symbol = code + ".KQ"
+            else:
+                symbol = code + ".KS"
+
+            stocks.append({
+                "name": name,
+                "symbol": symbol,
+                "market": market or "Korea",
+                "type": "EQUITY"
+            })
+
+    except Exception:
+        stocks = []
+
+    KRX_CACHE = stocks
+    return stocks
+
+
+def search_krx_by_name(q: str):
+    q = q.strip().lower()
+    results = []
+
+    if not q:
+        return results
+
+    for item in get_krx_stocks():
+        name = item["name"].lower()
+        symbol = item["symbol"].lower()
+        pure_code = symbol.replace(".ks", "").replace(".kq", "")
+
+        if q in name or q in symbol or q in pure_code:
+            results.append(item)
+
+        if len(results) >= 20:
+            break
+
+    return results
+
+
+def yahoo_search(q: str):
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        params = {
+            "q": q,
+            "quotesCount": 20,
+            "newsCount": 0,
+            "enableFuzzyQuery": "true"
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        res = requests.get(url, params=params, headers=headers, timeout=8)
+        data = res.json()
+
+        results = []
+
+        for item in data.get("quotes", []):
+            symbol = item.get("symbol")
+            name = item.get("shortname") or item.get("longname") or item.get("name")
+            exchange = item.get("exchange") or item.get("exchDisp") or "Unknown"
+            quote_type = item.get("quoteType", "")
+
+            if symbol:
+                results.append({
+                    "name": name or symbol,
+                    "symbol": symbol,
+                    "market": exchange,
+                    "type": quote_type
+                })
+
+        return results
+
+    except Exception:
+        return []
+
+
 def validate_period(period: str):
     allowed = {"1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"}
     return period if period in allowed else "1y"
@@ -232,9 +338,25 @@ def normalize_symbol(value: str):
         return value[start:end].strip()
 
     if value.isdigit() and len(value) == 6:
+        krx_results = search_krx_by_name(value)
+        if krx_results:
+            return krx_results[0]["symbol"]
         return value + ".KS"
 
+    if contains_korean(value):
+        krx_results = search_krx_by_name(value)
+        if krx_results:
+            return krx_results[0]["symbol"]
+
+        searched = yahoo_search(value)
+        if searched:
+            return searched[0]["symbol"]
+
     return value.upper()
+
+
+def contains_korean(text: str):
+    return any("가" <= ch <= "힣" for ch in text)
 
 
 def is_bad_number(x):
@@ -246,22 +368,26 @@ def is_bad_number(x):
 
 def clean_list(values):
     cleaned = []
+
     for x in values:
         if is_bad_number(x):
             cleaned.append(None)
         else:
             cleaned.append(round(float(x), 2))
+
     return cleaned
 
 
 def moving_average(values, window):
     result = []
+
     for i in range(len(values)):
         if i + 1 < window:
             result.append(None)
         else:
             avg = np.mean(values[i + 1 - window:i + 1])
             result.append(round(float(avg), 2))
+
     return result
 
 
@@ -351,6 +477,7 @@ def news_sentiment(ticker):
                 score -= 1
 
         date_text = ""
+
         if published:
             try:
                 date_text = datetime.fromtimestamp(published).strftime("%Y-%m-%d")
@@ -443,8 +570,11 @@ def make_technical_text(symbol, rsi, period_change, daily_change):
 def make_pattern_text(period_change, rsi):
     if period_change > 10:
         return "선택 기간 동안 우상향 흐름이 나타납니다. 추세 지속형 패턴 또는 신고가 돌파 가능성을 확인해야 합니다."
+
     if period_change < -10:
         return "약세 흐름이 나타납니다. 지지선 이탈 여부와 거래량 증가 여부를 확인해야 합니다."
+
     if 45 <= rsi <= 60:
         return "강한 방향성보다는 박스권 또는 횡보 패턴 가능성이 있습니다."
+
     return "현재 구간은 뚜렷한 패턴보다 변동성 확인이 우선입니다."

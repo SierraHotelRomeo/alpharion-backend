@@ -3,3 +3,5 @@ uvicorn
 yfinance
 numpy
 requests
+finance-datareader
+pandas
