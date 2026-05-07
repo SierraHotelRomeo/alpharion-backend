@@ -23,7 +23,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 KOREAN_NAME_MAP = {
     "삼성전자": "005930.KS",
     "SK하이닉스": "000660.KS",
@@ -43,6 +42,7 @@ KOREAN_NAME_MAP = {
     "현대로템": "064350.KS",
     "한화에어로스페이스": "012450.KS",
     "산일전기": "062040.KS",
+    "팬오션": "028670.KS",
 }
 
 KRX_CACHE = None
@@ -65,7 +65,6 @@ def health():
 @app.get("/api/search")
 def search_stock(q: str = Query("")):
     q = q.strip()
-
     if not q:
         return []
 
@@ -83,10 +82,9 @@ def search_stock(q: str = Query("")):
             seen.add(symbol)
 
     for item in search_krx_by_name(q):
-        symbol = item["symbol"]
-        if symbol not in seen:
+        if item["symbol"] not in seen:
             results.append(item)
-            seen.add(symbol)
+            seen.add(item["symbol"])
 
     if q.isdigit() and len(q) == 6:
         for suffix, market in [(".KS", "Korea"), (".KQ", "Korea KOSDAQ")]:
@@ -120,6 +118,7 @@ def search_stock(q: str = Query("")):
 
 @app.get("/api/stock/{symbol}")
 def get_stock(symbol: str, period: str = "1y"):
+    original_input = symbol
     symbol = normalize_symbol(symbol)
     period = validate_period(period)
 
@@ -145,6 +144,9 @@ def get_stock(symbol: str, period: str = "1y"):
         low_prices = hist["Low"].tolist()
         close_prices = hist["Close"].tolist()
         volumes = hist["Volume"].tolist()
+
+        display_name = get_display_name(symbol, original_input)
+        currency = "KRW" if symbol.endswith(".KS") or symbol.endswith(".KQ") else "USD"
 
         rsi = calculate_rsi(close_prices)
         ma5 = moving_average(close_prices, 5)
@@ -172,6 +174,8 @@ def get_stock(symbol: str, period: str = "1y"):
 
         return {
             "symbol": symbol.upper(),
+            "name": display_name,
+            "currency": currency,
             "dates": dates,
             "open": clean_list(open_prices),
             "high": clean_list(high_prices),
@@ -197,14 +201,12 @@ def get_stock(symbol: str, period: str = "1y"):
                 "news_score": news["score"],
             },
             "analysis": {
-                "technical": make_technical_text(symbol, rsi, period_change, daily_change),
+                "technical": make_technical_text(display_name, rsi, period_change, daily_change),
                 "pattern": make_pattern_text(period_change, rsi),
                 "lstm": forecast["text"],
                 "news": news["text"],
                 "auto_signal": auto_signal["text"],
-                "fundamental": "현재 버전은 가격·거래량·뉴스 감성 기반 분석입니다.",
-                "macro": "금리, 환율, 국채금리, 유가 등 거시지표 API를 연결하면 시장 위험도 점수화가 가능합니다.",
-                "sector": "섹터별 상대수익률, 밸류에이션, 모멘텀을 연결하면 종목의 상대적 위치를 분석할 수 있습니다.",
+                "market_summary": f"{display_name}의 현재가는 {round(float(last), 2)}이며, 선택 기간 수익률은 {round(float(period_change), 2)}%입니다. 현재 신호는 '{auto_signal['label']}'입니다.",
             },
             "news": news["items"]
         }
@@ -214,52 +216,19 @@ def get_stock(symbol: str, period: str = "1y"):
 
 
 @app.get("/api/module/{module_id}")
-def get_module(module_id: str, symbol: str = "NVDA", period: str = "6mo"):
-    symbol = normalize_symbol(symbol)
-    period = validate_period(period)
-
+def get_module(module_id: str):
     if module_id == "market":
         return market_overview()
-
     if module_id == "fundamental":
-        return fundamental_diagnosis(symbol)
-
+        return market_fundamental()
     if module_id == "signal":
-        data = get_stock(symbol, period)
-        if data.get("error"):
-            return data
-        s = data["summary"]
-        return {
-            "title": "신호",
-            "subtitle": "매수·매도 가능성",
-            "cards": [
-                {"label": "현재 신호", "value": s["signal"]},
-                {"label": "신호 점수", "value": s["score"]},
-                {"label": "RSI", "value": s["rsi"]},
-                {"label": "AI 30일 예측", "value": f'{s["forecast_30d"]}%'},
-            ],
-            "insight": data["analysis"]["auto_signal"],
-            "rows": [
-                {"name": "기술적 분석", "value": data["analysis"]["technical"]},
-                {"name": "차트패턴", "value": data["analysis"]["pattern"]},
-                {"name": "뉴스 감성", "value": data["analysis"]["news"]},
-            ],
-            "chart": {
-                "labels": data["dates"],
-                "values": data["close"],
-                "label": symbol.upper()
-            }
-        }
-
+        return market_signal()
     if module_id == "macro":
         return macro_monitoring()
-
     if module_id == "sector_valuation":
         return sector_valuation()
-
     if module_id == "sector_momentum":
         return sector_momentum()
-
     if module_id == "market_value":
         return market_value()
 
@@ -267,93 +236,94 @@ def get_module(module_id: str, symbol: str = "NVDA", period: str = "6mo"):
 
 
 def market_overview():
-    tickers = {
+    items = {
         "S&P 500": "^GSPC",
         "NASDAQ": "^IXIC",
         "KOSPI": "^KS11",
         "KOSDAQ": "^KQ11",
         "USD/KRW": "KRW=X",
-        "WTI": "CL=F"
+        "WTI": "CL=F",
     }
 
-    rows = []
-    labels = []
-    values = []
+    rows, labels, values = build_metric_rows(items, "1mo")
+    avg = safe_mean(values)
 
-    for name, symbol in tickers.items():
-        metric = quick_metric(symbol)
-        rows.append({"name": name, "value": metric["text"]})
-        labels.append(name)
-        values.append(metric["change"])
-
-    sentiment = "중립"
-    avg = float(np.mean(values)) if values else 0
-    if avg > 0.8:
-        sentiment = "긍정"
-    elif avg < -0.8:
-        sentiment = "부정"
+    sentiment = "긍정" if avg > 0.8 else "부정" if avg < -0.8 else "중립"
 
     return {
         "title": "시황",
-        "subtitle": "시장 심리 요약",
+        "subtitle": "주요 지수·환율·원자재 기준 시장 심리 요약",
         "cards": [
             {"label": "시장 심리", "value": sentiment},
             {"label": "평균 변동률", "value": f"{round(avg, 2)}%"},
             {"label": "관찰 지표", "value": len(rows)},
             {"label": "업데이트", "value": datetime.now().strftime("%Y-%m-%d")},
         ],
-        "insight": "주요 지수와 원자재 흐름을 기준으로 시장 분위기를 요약했습니다.",
+        "insight": "주요 글로벌 지수, 한국 지수, 환율, 원자재 흐름을 기반으로 시장 분위기를 요약했습니다.",
         "rows": rows,
         "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
     }
 
 
-def fundamental_diagnosis(symbol):
-    try:
-        t = yf.Ticker(symbol)
-        info = t.info or {}
-        pe = info.get("trailingPE") or info.get("forwardPE")
-        eps = info.get("trailingEps")
-        market_cap = info.get("marketCap")
-        revenue_growth = info.get("revenueGrowth")
-        profit_margin = info.get("profitMargins")
+def market_fundamental():
+    items = {
+        "S&P 500 ETF": "SPY",
+        "NASDAQ ETF": "QQQ",
+        "Korea ETF": "EWY",
+        "US Value ETF": "VTV",
+        "US Growth ETF": "VUG",
+    }
 
-        cards = [
-            {"label": "PER", "value": safe_round(pe)},
-            {"label": "EPS", "value": safe_round(eps)},
-            {"label": "시가총액", "value": format_large_number(market_cap)},
-            {"label": "매출 성장률", "value": percent_text(revenue_growth)},
-        ]
+    rows, labels, values = build_metric_rows(items, "1y")
+    avg = safe_mean(values)
 
-        rows = [
-            {"name": "수익성", "value": f"순이익률은 {percent_text(profit_margin)}입니다."},
-            {"name": "밸류에이션", "value": f"PER 기준 값은 {safe_round(pe)}입니다."},
-            {"name": "성장성", "value": f"매출 성장률은 {percent_text(revenue_growth)}입니다."},
-        ]
+    return {
+        "title": "펀더멘털",
+        "subtitle": "시장 ETF 기반 기본 체력 진단",
+        "cards": [
+            {"label": "시장 체력", "value": "양호" if avg > 5 else "보통" if avg > -5 else "약화"},
+            {"label": "평균 1Y 수익률", "value": f"{round(avg, 2)}%"},
+            {"label": "관찰 ETF", "value": len(rows)},
+            {"label": "기준", "value": "1년"},
+        ],
+        "insight": "개별 종목이 아니라 주요 시장 ETF의 장기 수익률을 기준으로 시장의 기본 체력을 진단합니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
+    }
 
-        return {
-            "title": "펀더멘털",
-            "subtitle": "Noise vs Signal",
-            "cards": cards,
-            "insight": f"{symbol.upper()}의 기본 재무 지표를 기준으로 펀더멘털 상태를 진단했습니다.",
-            "rows": rows,
-            "chart": {
-                "labels": ["PER", "EPS", "Revenue Growth", "Profit Margin"],
-                "values": [
-                    float(pe or 0),
-                    float(eps or 0),
-                    float((revenue_growth or 0) * 100),
-                    float((profit_margin or 0) * 100)
-                ],
-                "label": "Fundamental Metrics"
-            }
-        }
-    except Exception as e:
-        return {"error": str(e)}
+
+def market_signal():
+    items = {
+        "S&P 500": "^GSPC",
+        "NASDAQ": "^IXIC",
+        "KOSPI": "^KS11",
+        "KOSDAQ": "^KQ11",
+        "Russell 2000": "^RUT",
+    }
+
+    rows, labels, values = build_metric_rows(items, "1mo")
+    positive_count = len([v for v in values if v > 0])
+    negative_count = len([v for v in values if v < 0])
+
+    signal = "상승 우위" if positive_count > negative_count else "하락 경계" if negative_count > positive_count else "중립"
+
+    return {
+        "title": "신호",
+        "subtitle": "시장 지수 기반 상승·하락 신호",
+        "cards": [
+            {"label": "시장 신호", "value": signal},
+            {"label": "상승 지표", "value": positive_count},
+            {"label": "하락 지표", "value": negative_count},
+            {"label": "관찰 지표", "value": len(rows)},
+        ],
+        "insight": "개별 종목 신호가 아니라 주요 시장 지수의 최근 흐름을 기준으로 시장 방향성을 판단합니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "1M Return (%)"}
+    }
 
 
 def macro_monitoring():
-    tickers = {
+    items = {
         "US 10Y Yield": "^TNX",
         "Dollar Index": "DX-Y.NYB",
         "WTI Oil": "CL=F",
@@ -361,17 +331,8 @@ def macro_monitoring():
         "USD/KRW": "KRW=X",
     }
 
-    rows = []
-    labels = []
-    values = []
-
-    for name, symbol in tickers.items():
-        metric = quick_metric(symbol)
-        rows.append({"name": name, "value": metric["text"]})
-        labels.append(name)
-        values.append(metric["change"])
-
-    risk_score = sum(1 for v in values if v > 1.0)
+    rows, labels, values = build_metric_rows(items, "1mo")
+    risk_score = len([v for v in values if v > 1])
 
     return {
         "title": "거시경제",
@@ -389,7 +350,7 @@ def macro_monitoring():
 
 
 def sector_valuation():
-    sector_map = {
+    items = {
         "Technology": "XLK",
         "Financial": "XLF",
         "Healthcare": "XLV",
@@ -400,35 +361,26 @@ def sector_valuation():
         "Utilities": "XLU",
     }
 
-    rows = []
-    labels = []
-    values = []
-
-    for name, symbol in sector_map.items():
-        metric = quick_metric(symbol, "1y")
-        labels.append(name)
-        values.append(metric["change"])
-        rows.append({"name": name, "value": metric["text"]})
-
-    best_index = int(np.argmax(values)) if values else 0
+    rows, labels, values = build_metric_rows(items, "1y")
+    best = labels[int(np.argmax(values))] if values else "-"
 
     return {
         "title": "섹터 밸류에이션",
-        "subtitle": "섹터별 상대 성과",
+        "subtitle": "섹터 ETF 기반 상대 성과",
         "cards": [
-            {"label": "강세 섹터", "value": labels[best_index] if labels else "-"},
+            {"label": "강세 섹터", "value": best},
             {"label": "관찰 섹터", "value": len(rows)},
-            {"label": "평균 수익률", "value": f"{round(float(np.mean(values)), 2)}%" if values else "-"},
+            {"label": "평균 1Y 수익률", "value": f"{round(safe_mean(values), 2)}%"},
             {"label": "기준", "value": "1년"},
         ],
-        "insight": "섹터 ETF의 1년 성과를 기준으로 상대적으로 강한 섹터를 표시합니다.",
+        "insight": "섹터 ETF의 1년 성과를 비교해 상대적으로 강한 섹터를 확인합니다.",
         "rows": rows,
         "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
     }
 
 
 def sector_momentum():
-    sector_map = {
+    items = {
         "Technology": "XLK",
         "Financial": "XLF",
         "Healthcare": "XLV",
@@ -439,26 +391,17 @@ def sector_momentum():
         "Utilities": "XLU",
     }
 
-    rows = []
-    labels = []
-    values = []
-
-    for name, symbol in sector_map.items():
-        metric = quick_metric(symbol, "1mo")
-        labels.append(name)
-        values.append(metric["change"])
-        rows.append({"name": name, "value": metric["text"]})
-
+    rows, labels, values = build_metric_rows(items, "1mo")
     ranked = sorted(zip(labels, values), key=lambda x: x[1], reverse=True)
     leader = ranked[0][0] if ranked else "-"
 
     return {
         "title": "섹터 모멘텀",
-        "subtitle": "1개월 수익률 랭킹",
+        "subtitle": "최근 1개월 섹터 수익률 랭킹",
         "cards": [
             {"label": "1위 섹터", "value": leader},
             {"label": "관찰 섹터", "value": len(rows)},
-            {"label": "평균 모멘텀", "value": f"{round(float(np.mean(values)), 2)}%" if values else "-"},
+            {"label": "평균 모멘텀", "value": f"{round(safe_mean(values), 2)}%"},
             {"label": "기준", "value": "1개월"},
         ],
         "insight": "최근 1개월 섹터 ETF 흐름을 기준으로 단기 모멘텀을 측정합니다.",
@@ -468,7 +411,7 @@ def sector_momentum():
 
 
 def market_value():
-    tickers = {
+    items = {
         "SPY": "SPY",
         "QQQ": "QQQ",
         "DIA": "DIA",
@@ -476,22 +419,14 @@ def market_value():
         "EWY": "EWY",
     }
 
-    rows = []
-    labels = []
-    values = []
+    rows, labels, values = build_metric_rows(items, "1y")
+    avg = safe_mean(values)
 
-    for name, symbol in tickers.items():
-        metric = quick_metric(symbol, "1y")
-        rows.append({"name": name, "value": metric["text"]})
-        labels.append(name)
-        values.append(metric["change"])
-
-    avg = float(np.mean(values)) if values else 0
     valuation = "고평가 경계" if avg > 15 else "중립" if avg > -5 else "저평가 가능성"
 
     return {
         "title": "시장 밸류",
-        "subtitle": "ETF 기반 고·저평가 점검",
+        "subtitle": "주요 ETF 기반 고·저평가 점검",
         "cards": [
             {"label": "시장 판단", "value": valuation},
             {"label": "평균 1Y 수익률", "value": f"{round(avg, 2)}%"},
@@ -502,6 +437,20 @@ def market_value():
         "rows": rows,
         "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
     }
+
+
+def build_metric_rows(items, period):
+    rows = []
+    labels = []
+    values = []
+
+    for name, symbol in items.items():
+        metric = quick_metric(symbol, period)
+        rows.append({"name": name, "value": metric["text"]})
+        labels.append(name)
+        values.append(metric["change"])
+
+    return rows, labels, values
 
 
 def quick_metric(symbol, period="1mo"):
@@ -650,6 +599,30 @@ def normalize_symbol(value: str):
             return searched[0]["symbol"]
 
     return value.upper()
+
+
+def get_display_name(symbol: str, original_input: str = ""):
+    original_input = original_input.strip()
+
+    if "(" in original_input and ")" in original_input:
+        return original_input.split("(")[0].strip()
+
+    if original_input in KOREAN_NAME_MAP:
+        return original_input
+
+    for name, code in KOREAN_NAME_MAP.items():
+        if code == symbol:
+            return name
+
+    for item in get_krx_stocks():
+        if item["symbol"] == symbol:
+            return item["name"]
+
+    try:
+        info = yf.Ticker(symbol).info or {}
+        return info.get("shortName") or info.get("longName") or symbol
+    except Exception:
+        return symbol
 
 
 def contains_korean(text: str):
@@ -869,9 +842,9 @@ def automatic_buy_signal(rsi, period_change, daily_change, forecast_change, news
     }
 
 
-def make_technical_text(symbol, rsi, period_change, daily_change):
+def make_technical_text(name, rsi, period_change, daily_change):
     return (
-        f"{symbol.upper()}는 선택 기간 기준 {period_change:.2f}% 변동했습니다. "
+        f"{name}는 선택 기간 기준 {period_change:.2f}% 변동했습니다. "
         f"RSI는 {rsi:.1f}이며, 직전 거래일 대비 변동률은 {daily_change:.2f}%입니다."
     )
 
@@ -889,35 +862,8 @@ def make_pattern_text(period_change, rsi):
     return "현재 구간은 뚜렷한 패턴보다 변동성 확인이 우선입니다."
 
 
-def safe_round(value):
+def safe_mean(values):
     try:
-        if value is None:
-            return "-"
-        return round(float(value), 2)
+        return float(np.mean(values)) if values else 0
     except Exception:
-        return "-"
-
-
-def percent_text(value):
-    try:
-        if value is None:
-            return "-"
-        return f"{round(float(value) * 100, 2)}%"
-    except Exception:
-        return "-"
-
-
-def format_large_number(value):
-    try:
-        if value is None:
-            return "-"
-        value = float(value)
-        if value >= 1_000_000_000_000:
-            return f"{round(value / 1_000_000_000_000, 2)}T"
-        if value >= 1_000_000_000:
-            return f"{round(value / 1_000_000_000, 2)}B"
-        if value >= 1_000_000:
-            return f"{round(value / 1_000_000, 2)}M"
-        return str(round(value, 2))
-    except Exception:
-        return "-"
+        return 0
