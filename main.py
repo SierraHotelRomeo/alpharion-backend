@@ -216,26 +216,28 @@ def get_stock(symbol: str, period: str = "1y"):
 
 
 @app.get("/api/module/{module_id}")
-def get_module(module_id: str):
+def get_module(module_id: str, symbol: str = "SPY", period: str = "6mo"):
+    period = validate_period(period)
+
     if module_id == "market":
-        return market_overview()
+        return market_overview(period)
     if module_id == "fundamental":
-        return market_fundamental()
+        return market_fundamental(period)
     if module_id == "signal":
-        return market_signal()
+        return market_signal(period)
     if module_id == "macro":
-        return macro_monitoring()
+        return macro_monitoring(period)
     if module_id == "sector_valuation":
-        return sector_valuation()
+        return sector_valuation(period)
     if module_id == "sector_momentum":
-        return sector_momentum()
+        return sector_momentum(period)
     if module_id == "market_value":
-        return market_value()
+        return market_value(period)
 
     return {"error": "Unknown module"}
 
 
-def market_overview():
+def market_overview(period):
     items = {
         "S&P 500": "^GSPC",
         "NASDAQ": "^IXIC",
@@ -245,27 +247,32 @@ def market_overview():
         "WTI": "CL=F",
     }
 
-    rows, labels, values = build_metric_rows(items, "1mo")
+    rows, labels, values = build_metric_rows(items, period)
     avg = safe_mean(values)
-
     sentiment = "긍정" if avg > 0.8 else "부정" if avg < -0.8 else "중립"
 
     return {
         "title": "시황",
-        "subtitle": "주요 지수·환율·원자재 기준 시장 심리 요약",
+        "subtitle": f"{period_label(period)} 기준 주요 지수·환율·원자재 시장 심리 요약",
         "cards": [
             {"label": "시장 심리", "value": sentiment},
             {"label": "평균 변동률", "value": f"{round(avg, 2)}%"},
             {"label": "관찰 지표", "value": len(rows)},
-            {"label": "업데이트", "value": datetime.now().strftime("%Y-%m-%d")},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
-        "insight": "주요 글로벌 지수, 한국 지수, 환율, 원자재 흐름을 기반으로 시장 분위기를 요약했습니다.",
+        "chart_title": f"시황 변동률 - {period_label(period)}",
+        "insight": f"{period_label(period)} 동안 주요 글로벌 지수, 한국 지수, 환율, 원자재 흐름을 기준으로 시장 분위기를 요약했습니다.",
+        "analysis_cards": [
+            {"title": "시장 심리", "text": f"평균 변동률은 {round(avg, 2)}%이며, 종합 시장 심리는 '{sentiment}'입니다."},
+            {"title": "위험 요인", "text": "환율, 유가, 금리성 지표가 동시에 상승하면 위험자산 부담이 커질 수 있습니다."},
+            {"title": "확인 포인트", "text": "상승 지표와 하락 지표의 비율을 확인해 단기 시장 방향성을 점검해야 합니다."},
+        ],
         "rows": rows,
         "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
     }
 
 
-def market_fundamental():
+def market_fundamental(period):
     items = {
         "S&P 500 ETF": "SPY",
         "NASDAQ ETF": "QQQ",
@@ -274,25 +281,32 @@ def market_fundamental():
         "US Growth ETF": "VUG",
     }
 
-    rows, labels, values = build_metric_rows(items, "1y")
+    rows, labels, values = build_metric_rows(items, period)
     avg = safe_mean(values)
+    status = "양호" if avg > 5 else "보통" if avg > -5 else "약화"
 
     return {
         "title": "펀더멘털",
-        "subtitle": "시장 ETF 기반 기본 체력 진단",
+        "subtitle": f"{period_label(period)} 기준 시장 ETF 기반 체력 진단",
         "cards": [
-            {"label": "시장 체력", "value": "양호" if avg > 5 else "보통" if avg > -5 else "약화"},
-            {"label": "평균 1Y 수익률", "value": f"{round(avg, 2)}%"},
+            {"label": "시장 체력", "value": status},
+            {"label": "평균 수익률", "value": f"{round(avg, 2)}%"},
             {"label": "관찰 ETF", "value": len(rows)},
-            {"label": "기준", "value": "1년"},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
-        "insight": "개별 종목이 아니라 주요 시장 ETF의 장기 수익률을 기준으로 시장의 기본 체력을 진단합니다.",
+        "chart_title": f"시장 ETF 수익률 - {period_label(period)}",
+        "insight": "개별 종목이 아니라 주요 시장 ETF의 기간별 성과를 기준으로 시장의 기본 체력을 진단합니다.",
+        "analysis_cards": [
+            {"title": "시장 체력", "text": f"{period_label(period)} 기준 평균 수익률은 {round(avg, 2)}%이며, 시장 체력은 '{status}'로 판단됩니다."},
+            {"title": "성장/가치 비교", "text": "Growth ETF와 Value ETF의 상대 흐름을 보면 시장 선호 스타일을 확인할 수 있습니다."},
+            {"title": "한국시장 위치", "text": "EWY 흐름을 미국 주요 ETF와 비교하면 한국 시장의 상대 강도를 볼 수 있습니다."},
+        ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
     }
 
 
-def market_signal():
+def market_signal(period):
     items = {
         "S&P 500": "^GSPC",
         "NASDAQ": "^IXIC",
@@ -301,28 +315,33 @@ def market_signal():
         "Russell 2000": "^RUT",
     }
 
-    rows, labels, values = build_metric_rows(items, "1mo")
+    rows, labels, values = build_metric_rows(items, period)
     positive_count = len([v for v in values if v > 0])
     negative_count = len([v for v in values if v < 0])
-
     signal = "상승 우위" if positive_count > negative_count else "하락 경계" if negative_count > positive_count else "중립"
 
     return {
         "title": "신호",
-        "subtitle": "시장 지수 기반 상승·하락 신호",
+        "subtitle": f"{period_label(period)} 기준 시장 지수 상승·하락 신호",
         "cards": [
             {"label": "시장 신호", "value": signal},
             {"label": "상승 지표", "value": positive_count},
             {"label": "하락 지표", "value": negative_count},
-            {"label": "관찰 지표", "value": len(rows)},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
+        "chart_title": f"시장 방향성 신호 - {period_label(period)}",
         "insight": "개별 종목 신호가 아니라 주요 시장 지수의 최근 흐름을 기준으로 시장 방향성을 판단합니다.",
+        "analysis_cards": [
+            {"title": "상승/하락 비율", "text": f"상승 지표는 {positive_count}개, 하락 지표는 {negative_count}개이며 시장 신호는 '{signal}'입니다."},
+            {"title": "시장 폭", "text": "여러 지수가 동시에 상승하면 시장 폭이 넓은 상승으로 해석할 수 있습니다."},
+            {"title": "주의 구간", "text": "일부 대형 지수만 상승하고 중소형 지수가 약하면 상승 지속성을 확인해야 합니다."},
+        ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "1M Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
     }
 
 
-def macro_monitoring():
+def macro_monitoring(period):
     items = {
         "US 10Y Yield": "^TNX",
         "Dollar Index": "DX-Y.NYB",
@@ -331,86 +350,84 @@ def macro_monitoring():
         "USD/KRW": "KRW=X",
     }
 
-    rows, labels, values = build_metric_rows(items, "1mo")
+    rows, labels, values = build_metric_rows(items, period)
     risk_score = len([v for v in values if v > 1])
 
     return {
         "title": "거시경제",
-        "subtitle": "금리·환율·원자재 모니터링",
+        "subtitle": f"{period_label(period)} 기준 금리·환율·원자재 모니터링",
         "cards": [
             {"label": "Macro Risk", "value": "높음" if risk_score >= 3 else "보통"},
             {"label": "관찰 지표", "value": len(rows)},
             {"label": "상승 지표", "value": risk_score},
-            {"label": "업데이트", "value": datetime.now().strftime("%Y-%m-%d")},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
+        "chart_title": f"거시경제 지표 변동률 - {period_label(period)}",
         "insight": "금리, 달러, 유가, 금, 환율을 통해 시장의 거시 위험을 점검합니다.",
+        "analysis_cards": [
+            {"title": "금리 분석", "text": "미국 10년물 금리 상승은 성장주 밸류에이션에 부담을 줄 수 있습니다."},
+            {"title": "환율 분석", "text": "USD/KRW 상승은 외국인 수급과 수입물가 부담을 함께 확인해야 합니다."},
+            {"title": "원자재 분석", "text": "유가와 금 가격은 인플레이션 및 위험회피 심리 판단에 활용됩니다."},
+        ],
         "rows": rows,
         "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
     }
 
 
-def sector_valuation():
-    items = {
-        "Technology": "XLK",
-        "Financial": "XLF",
-        "Healthcare": "XLV",
-        "Energy": "XLE",
-        "Consumer Discretionary": "XLY",
-        "Consumer Staples": "XLP",
-        "Industrial": "XLI",
-        "Utilities": "XLU",
-    }
-
-    rows, labels, values = build_metric_rows(items, "1y")
+def sector_valuation(period):
+    items = sector_items()
+    rows, labels, values = build_metric_rows(items, period)
     best = labels[int(np.argmax(values))] if values else "-"
 
     return {
         "title": "섹터 밸류에이션",
-        "subtitle": "섹터 ETF 기반 상대 성과",
+        "subtitle": f"{period_label(period)} 기준 섹터 ETF 상대 성과",
         "cards": [
             {"label": "강세 섹터", "value": best},
             {"label": "관찰 섹터", "value": len(rows)},
-            {"label": "평균 1Y 수익률", "value": f"{round(safe_mean(values), 2)}%"},
-            {"label": "기준", "value": "1년"},
+            {"label": "평균 수익률", "value": f"{round(safe_mean(values), 2)}%"},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
-        "insight": "섹터 ETF의 1년 성과를 비교해 상대적으로 강한 섹터를 확인합니다.",
+        "chart_title": f"섹터 상대 성과 - {period_label(period)}",
+        "insight": "섹터 ETF의 기간별 성과를 비교해 상대적으로 강한 섹터를 확인합니다.",
+        "analysis_cards": [
+            {"title": "강세 섹터", "text": f"{period_label(period)} 기준 가장 강한 섹터는 {best}입니다."},
+            {"title": "상대 밸류", "text": "가격 성과가 강한 섹터는 이익 기대 또는 자금 유입 가능성을 함께 확인해야 합니다."},
+            {"title": "분산 확인", "text": "특정 섹터만 강하면 순환매인지, 구조적 강세인지 추가 확인이 필요합니다."},
+        ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
     }
 
 
-def sector_momentum():
-    items = {
-        "Technology": "XLK",
-        "Financial": "XLF",
-        "Healthcare": "XLV",
-        "Energy": "XLE",
-        "Consumer Discretionary": "XLY",
-        "Consumer Staples": "XLP",
-        "Industrial": "XLI",
-        "Utilities": "XLU",
-    }
-
-    rows, labels, values = build_metric_rows(items, "1mo")
+def sector_momentum(period):
+    items = sector_items()
+    rows, labels, values = build_metric_rows(items, period)
     ranked = sorted(zip(labels, values), key=lambda x: x[1], reverse=True)
     leader = ranked[0][0] if ranked else "-"
 
     return {
         "title": "섹터 모멘텀",
-        "subtitle": "최근 1개월 섹터 수익률 랭킹",
+        "subtitle": f"{period_label(period)} 기준 섹터 수익률 랭킹",
         "cards": [
             {"label": "1위 섹터", "value": leader},
             {"label": "관찰 섹터", "value": len(rows)},
             {"label": "평균 모멘텀", "value": f"{round(safe_mean(values), 2)}%"},
-            {"label": "기준", "value": "1개월"},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
-        "insight": "최근 1개월 섹터 ETF 흐름을 기준으로 단기 모멘텀을 측정합니다.",
+        "chart_title": f"섹터 모멘텀 - {period_label(period)}",
+        "insight": "기간별 섹터 ETF 흐름을 기준으로 단기·중기 모멘텀을 측정합니다.",
+        "analysis_cards": [
+            {"title": "모멘텀 리더", "text": f"{period_label(period)} 기준 모멘텀 1위 섹터는 {leader}입니다."},
+            {"title": "순환매 가능성", "text": "기간을 바꾸며 리더 섹터가 바뀌는지 확인하면 순환매 흐름을 볼 수 있습니다."},
+            {"title": "추세 지속성", "text": "1개월과 6개월 모두 강한 섹터는 추세 지속 가능성을 더 높게 볼 수 있습니다."},
+        ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "1M Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
     }
 
 
-def market_value():
+def market_value(period):
     items = {
         "SPY": "SPY",
         "QQQ": "QQQ",
@@ -419,23 +436,41 @@ def market_value():
         "EWY": "EWY",
     }
 
-    rows, labels, values = build_metric_rows(items, "1y")
+    rows, labels, values = build_metric_rows(items, period)
     avg = safe_mean(values)
-
     valuation = "고평가 경계" if avg > 15 else "중립" if avg > -5 else "저평가 가능성"
 
     return {
         "title": "시장 밸류",
-        "subtitle": "주요 ETF 기반 고·저평가 점검",
+        "subtitle": f"{period_label(period)} 기준 주요 ETF 고·저평가 점검",
         "cards": [
             {"label": "시장 판단", "value": valuation},
-            {"label": "평균 1Y 수익률", "value": f"{round(avg, 2)}%"},
+            {"label": "평균 수익률", "value": f"{round(avg, 2)}%"},
             {"label": "관찰 ETF", "value": len(rows)},
-            {"label": "기준", "value": "1년"},
+            {"label": "분석 기간", "value": period_label(period)},
         ],
-        "insight": "주요 시장 ETF의 1년 성과를 기준으로 시장의 고평가·저평가 가능성을 점검합니다.",
+        "chart_title": f"시장 밸류 점검 - {period_label(period)}",
+        "insight": "주요 시장 ETF의 기간별 성과를 기준으로 시장의 고평가·저평가 가능성을 점검합니다.",
+        "analysis_cards": [
+            {"title": "시장 판단", "text": f"{period_label(period)} 기준 시장 판단은 '{valuation}'입니다."},
+            {"title": "과열 확인", "text": "주요 ETF가 장기간 급등한 경우 단기 조정 가능성을 함께 확인해야 합니다."},
+            {"title": "저평가 가능성", "text": "장기 하락 이후 회복 신호가 나타나면 저평가 반등 가능성을 점검할 수 있습니다."},
+        ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
+    }
+
+
+def sector_items():
+    return {
+        "Technology": "XLK",
+        "Financial": "XLF",
+        "Healthcare": "XLV",
+        "Energy": "XLE",
+        "Consumer Discretionary": "XLY",
+        "Consumer Staples": "XLP",
+        "Industrial": "XLI",
+        "Utilities": "XLU",
     }
 
 
@@ -570,6 +605,20 @@ def yahoo_search(q: str):
 def validate_period(period: str):
     allowed = {"1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"}
     return period if period in allowed else "1y"
+
+
+def period_label(period: str):
+    labels = {
+        "1mo": "1개월",
+        "3mo": "3개월",
+        "6mo": "6개월",
+        "1y": "1년",
+        "2y": "2년",
+        "5y": "5년",
+        "10y": "10년",
+        "max": "전체 기간",
+    }
+    return labels.get(period, "1년")
 
 
 def normalize_symbol(value: str):
