@@ -72,7 +72,6 @@ def search_stock(q: str = Query("")):
     results = []
     seen = set()
 
-    # 1. 주요 국내 종목 직접 매칭
     for name, symbol in KOREAN_NAME_MAP.items():
         if q.lower() in name.lower() or q.lower() in symbol.lower():
             results.append({
@@ -83,15 +82,12 @@ def search_stock(q: str = Query("")):
             })
             seen.add(symbol)
 
-    # 2. KRX 전체 종목명 검색
-    krx_results = search_krx_by_name(q)
-    for item in krx_results:
+    for item in search_krx_by_name(q):
         symbol = item["symbol"]
         if symbol not in seen:
             results.append(item)
             seen.add(symbol)
 
-    # 3. 6자리 숫자 코드 입력 시
     if q.isdigit() and len(q) == 6:
         for suffix, market in [(".KS", "Korea"), (".KQ", "Korea KOSDAQ")]:
             symbol = q + suffix
@@ -104,15 +100,12 @@ def search_stock(q: str = Query("")):
                 })
                 seen.add(symbol)
 
-    # 4. Yahoo 전세계 검색
-    yahoo_results = yahoo_search(q)
-    for item in yahoo_results:
+    for item in yahoo_search(q):
         symbol = item.get("symbol")
         if symbol and symbol not in seen:
             results.append(item)
             seen.add(symbol)
 
-    # 5. 직접 티커 fallback
     if not results:
         guessed = normalize_symbol(q)
         results.append({
@@ -134,7 +127,6 @@ def get_stock(symbol: str, period: str = "1y"):
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period=period, interval="1d")
 
-        # .KS 실패 시 .KQ 재시도
         if hist.empty and symbol.endswith(".KS"):
             alt_symbol = symbol.replace(".KS", ".KQ")
             ticker = yf.Ticker(alt_symbol)
@@ -155,7 +147,6 @@ def get_stock(symbol: str, period: str = "1y"):
         volumes = hist["Volume"].tolist()
 
         rsi = calculate_rsi(close_prices)
-
         ma5 = moving_average(close_prices, 5)
         ma20 = moving_average(close_prices, 20)
         ma60 = moving_average(close_prices, 60)
@@ -169,7 +160,7 @@ def get_stock(symbol: str, period: str = "1y"):
         daily_change = ((last - prev) / prev) * 100
 
         forecast = ai_momentum_forecast(close_prices)
-        news = news_sentiment(ticker)
+        news = safe_news_sentiment(ticker)
 
         auto_signal = automatic_buy_signal(
             rsi=rsi,
@@ -222,6 +213,315 @@ def get_stock(symbol: str, period: str = "1y"):
         return {"error": str(e)}
 
 
+@app.get("/api/module/{module_id}")
+def get_module(module_id: str, symbol: str = "NVDA", period: str = "6mo"):
+    symbol = normalize_symbol(symbol)
+    period = validate_period(period)
+
+    if module_id == "market":
+        return market_overview()
+
+    if module_id == "fundamental":
+        return fundamental_diagnosis(symbol)
+
+    if module_id == "signal":
+        data = get_stock(symbol, period)
+        if data.get("error"):
+            return data
+        s = data["summary"]
+        return {
+            "title": "신호",
+            "subtitle": "매수·매도 가능성",
+            "cards": [
+                {"label": "현재 신호", "value": s["signal"]},
+                {"label": "신호 점수", "value": s["score"]},
+                {"label": "RSI", "value": s["rsi"]},
+                {"label": "AI 30일 예측", "value": f'{s["forecast_30d"]}%'},
+            ],
+            "insight": data["analysis"]["auto_signal"],
+            "rows": [
+                {"name": "기술적 분석", "value": data["analysis"]["technical"]},
+                {"name": "차트패턴", "value": data["analysis"]["pattern"]},
+                {"name": "뉴스 감성", "value": data["analysis"]["news"]},
+            ],
+            "chart": {
+                "labels": data["dates"],
+                "values": data["close"],
+                "label": symbol.upper()
+            }
+        }
+
+    if module_id == "macro":
+        return macro_monitoring()
+
+    if module_id == "sector_valuation":
+        return sector_valuation()
+
+    if module_id == "sector_momentum":
+        return sector_momentum()
+
+    if module_id == "market_value":
+        return market_value()
+
+    return {"error": "Unknown module"}
+
+
+def market_overview():
+    tickers = {
+        "S&P 500": "^GSPC",
+        "NASDAQ": "^IXIC",
+        "KOSPI": "^KS11",
+        "KOSDAQ": "^KQ11",
+        "USD/KRW": "KRW=X",
+        "WTI": "CL=F"
+    }
+
+    rows = []
+    labels = []
+    values = []
+
+    for name, symbol in tickers.items():
+        metric = quick_metric(symbol)
+        rows.append({"name": name, "value": metric["text"]})
+        labels.append(name)
+        values.append(metric["change"])
+
+    sentiment = "중립"
+    avg = float(np.mean(values)) if values else 0
+    if avg > 0.8:
+        sentiment = "긍정"
+    elif avg < -0.8:
+        sentiment = "부정"
+
+    return {
+        "title": "시황",
+        "subtitle": "시장 심리 요약",
+        "cards": [
+            {"label": "시장 심리", "value": sentiment},
+            {"label": "평균 변동률", "value": f"{round(avg, 2)}%"},
+            {"label": "관찰 지표", "value": len(rows)},
+            {"label": "업데이트", "value": datetime.now().strftime("%Y-%m-%d")},
+        ],
+        "insight": "주요 지수와 원자재 흐름을 기준으로 시장 분위기를 요약했습니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
+    }
+
+
+def fundamental_diagnosis(symbol):
+    try:
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+        pe = info.get("trailingPE") or info.get("forwardPE")
+        eps = info.get("trailingEps")
+        market_cap = info.get("marketCap")
+        revenue_growth = info.get("revenueGrowth")
+        profit_margin = info.get("profitMargins")
+
+        cards = [
+            {"label": "PER", "value": safe_round(pe)},
+            {"label": "EPS", "value": safe_round(eps)},
+            {"label": "시가총액", "value": format_large_number(market_cap)},
+            {"label": "매출 성장률", "value": percent_text(revenue_growth)},
+        ]
+
+        rows = [
+            {"name": "수익성", "value": f"순이익률은 {percent_text(profit_margin)}입니다."},
+            {"name": "밸류에이션", "value": f"PER 기준 값은 {safe_round(pe)}입니다."},
+            {"name": "성장성", "value": f"매출 성장률은 {percent_text(revenue_growth)}입니다."},
+        ]
+
+        return {
+            "title": "펀더멘털",
+            "subtitle": "Noise vs Signal",
+            "cards": cards,
+            "insight": f"{symbol.upper()}의 기본 재무 지표를 기준으로 펀더멘털 상태를 진단했습니다.",
+            "rows": rows,
+            "chart": {
+                "labels": ["PER", "EPS", "Revenue Growth", "Profit Margin"],
+                "values": [
+                    float(pe or 0),
+                    float(eps or 0),
+                    float((revenue_growth or 0) * 100),
+                    float((profit_margin or 0) * 100)
+                ],
+                "label": "Fundamental Metrics"
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def macro_monitoring():
+    tickers = {
+        "US 10Y Yield": "^TNX",
+        "Dollar Index": "DX-Y.NYB",
+        "WTI Oil": "CL=F",
+        "Gold": "GC=F",
+        "USD/KRW": "KRW=X",
+    }
+
+    rows = []
+    labels = []
+    values = []
+
+    for name, symbol in tickers.items():
+        metric = quick_metric(symbol)
+        rows.append({"name": name, "value": metric["text"]})
+        labels.append(name)
+        values.append(metric["change"])
+
+    risk_score = sum(1 for v in values if v > 1.0)
+
+    return {
+        "title": "거시경제",
+        "subtitle": "금리·환율·원자재 모니터링",
+        "cards": [
+            {"label": "Macro Risk", "value": "높음" if risk_score >= 3 else "보통"},
+            {"label": "관찰 지표", "value": len(rows)},
+            {"label": "상승 지표", "value": risk_score},
+            {"label": "업데이트", "value": datetime.now().strftime("%Y-%m-%d")},
+        ],
+        "insight": "금리, 달러, 유가, 금, 환율을 통해 시장의 거시 위험을 점검합니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
+    }
+
+
+def sector_valuation():
+    sector_map = {
+        "Technology": "XLK",
+        "Financial": "XLF",
+        "Healthcare": "XLV",
+        "Energy": "XLE",
+        "Consumer Discretionary": "XLY",
+        "Consumer Staples": "XLP",
+        "Industrial": "XLI",
+        "Utilities": "XLU",
+    }
+
+    rows = []
+    labels = []
+    values = []
+
+    for name, symbol in sector_map.items():
+        metric = quick_metric(symbol, "1y")
+        labels.append(name)
+        values.append(metric["change"])
+        rows.append({"name": name, "value": metric["text"]})
+
+    best_index = int(np.argmax(values)) if values else 0
+
+    return {
+        "title": "섹터 밸류에이션",
+        "subtitle": "섹터별 상대 성과",
+        "cards": [
+            {"label": "강세 섹터", "value": labels[best_index] if labels else "-"},
+            {"label": "관찰 섹터", "value": len(rows)},
+            {"label": "평균 수익률", "value": f"{round(float(np.mean(values)), 2)}%" if values else "-"},
+            {"label": "기준", "value": "1년"},
+        ],
+        "insight": "섹터 ETF의 1년 성과를 기준으로 상대적으로 강한 섹터를 표시합니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
+    }
+
+
+def sector_momentum():
+    sector_map = {
+        "Technology": "XLK",
+        "Financial": "XLF",
+        "Healthcare": "XLV",
+        "Energy": "XLE",
+        "Consumer Discretionary": "XLY",
+        "Consumer Staples": "XLP",
+        "Industrial": "XLI",
+        "Utilities": "XLU",
+    }
+
+    rows = []
+    labels = []
+    values = []
+
+    for name, symbol in sector_map.items():
+        metric = quick_metric(symbol, "1mo")
+        labels.append(name)
+        values.append(metric["change"])
+        rows.append({"name": name, "value": metric["text"]})
+
+    ranked = sorted(zip(labels, values), key=lambda x: x[1], reverse=True)
+    leader = ranked[0][0] if ranked else "-"
+
+    return {
+        "title": "섹터 모멘텀",
+        "subtitle": "1개월 수익률 랭킹",
+        "cards": [
+            {"label": "1위 섹터", "value": leader},
+            {"label": "관찰 섹터", "value": len(rows)},
+            {"label": "평균 모멘텀", "value": f"{round(float(np.mean(values)), 2)}%" if values else "-"},
+            {"label": "기준", "value": "1개월"},
+        ],
+        "insight": "최근 1개월 섹터 ETF 흐름을 기준으로 단기 모멘텀을 측정합니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "1M Return (%)"}
+    }
+
+
+def market_value():
+    tickers = {
+        "SPY": "SPY",
+        "QQQ": "QQQ",
+        "DIA": "DIA",
+        "IWM": "IWM",
+        "EWY": "EWY",
+    }
+
+    rows = []
+    labels = []
+    values = []
+
+    for name, symbol in tickers.items():
+        metric = quick_metric(symbol, "1y")
+        rows.append({"name": name, "value": metric["text"]})
+        labels.append(name)
+        values.append(metric["change"])
+
+    avg = float(np.mean(values)) if values else 0
+    valuation = "고평가 경계" if avg > 15 else "중립" if avg > -5 else "저평가 가능성"
+
+    return {
+        "title": "시장 밸류",
+        "subtitle": "ETF 기반 고·저평가 점검",
+        "cards": [
+            {"label": "시장 판단", "value": valuation},
+            {"label": "평균 1Y 수익률", "value": f"{round(avg, 2)}%"},
+            {"label": "관찰 ETF", "value": len(rows)},
+            {"label": "기준", "value": "1년"},
+        ],
+        "insight": "주요 시장 ETF의 1년 성과를 기준으로 시장의 고평가·저평가 가능성을 점검합니다.",
+        "rows": rows,
+        "chart": {"labels": labels, "values": values, "label": "1Y Return (%)"}
+    }
+
+
+def quick_metric(symbol, period="1mo"):
+    try:
+        hist = yf.Ticker(symbol).history(period=period, interval="1d").dropna()
+        if hist.empty:
+            return {"change": 0, "text": "데이터 없음"}
+
+        first = float(hist["Close"].iloc[0])
+        last = float(hist["Close"].iloc[-1])
+        change = ((last - first) / first) * 100
+
+        return {
+            "change": round(change, 2),
+            "text": f"{round(last, 2)} / {round(change, 2)}%"
+        }
+    except Exception:
+        return {"change": 0, "text": "데이터 없음"}
+
+
 def get_krx_stocks():
     global KRX_CACHE
 
@@ -245,10 +545,7 @@ def get_krx_stocks():
             if not name or not code:
                 continue
 
-            if market == "KOSDAQ":
-                symbol = code + ".KQ"
-            else:
-                symbol = code + ".KS"
+            symbol = code + ".KQ" if market == "KOSDAQ" else code + ".KS"
 
             stocks.append({
                 "name": name,
@@ -440,6 +737,18 @@ def ai_momentum_forecast(values):
     }
 
 
+def safe_news_sentiment(ticker):
+    try:
+        return news_sentiment(ticker)
+    except Exception:
+        return {
+            "score": 0,
+            "label": "중립",
+            "items": [],
+            "text": "뉴스 데이터를 가져오지 못했습니다."
+        }
+
+
 def news_sentiment(ticker):
     positive_words = [
         "beat", "growth", "strong", "surge", "record", "upgrade",
@@ -578,3 +887,37 @@ def make_pattern_text(period_change, rsi):
         return "강한 방향성보다는 박스권 또는 횡보 패턴 가능성이 있습니다."
 
     return "현재 구간은 뚜렷한 패턴보다 변동성 확인이 우선입니다."
+
+
+def safe_round(value):
+    try:
+        if value is None:
+            return "-"
+        return round(float(value), 2)
+    except Exception:
+        return "-"
+
+
+def percent_text(value):
+    try:
+        if value is None:
+            return "-"
+        return f"{round(float(value) * 100, 2)}%"
+    except Exception:
+        return "-"
+
+
+def format_large_number(value):
+    try:
+        if value is None:
+            return "-"
+        value = float(value)
+        if value >= 1_000_000_000_000:
+            return f"{round(value / 1_000_000_000_000, 2)}T"
+        if value >= 1_000_000_000:
+            return f"{round(value / 1_000_000_000, 2)}B"
+        if value >= 1_000_000:
+            return f"{round(value / 1_000_000, 2)}M"
+        return str(round(value, 2))
+    except Exception:
+        return "-"
