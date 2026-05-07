@@ -65,6 +65,7 @@ def health():
 @app.get("/api/search")
 def search_stock(q: str = Query("")):
     q = q.strip()
+
     if not q:
         return []
 
@@ -72,19 +73,21 @@ def search_stock(q: str = Query("")):
     seen = set()
 
     for name, symbol in KOREAN_NAME_MAP.items():
-        if q.lower() in name.lower() or q.lower() in symbol.lower():
-            results.append({
+        if normalize_text(q) in normalize_text(name) or normalize_text(q) in normalize_text(symbol):
+            item = {
                 "name": name,
                 "symbol": symbol,
                 "market": "Korea",
                 "type": "EQUITY"
-            })
+            }
+            results.append(item)
             seen.add(symbol)
 
     for item in search_krx_by_name(q):
-        if item["symbol"] not in seen:
+        symbol = item["symbol"]
+        if symbol not in seen:
             results.append(item)
-            seen.add(item["symbol"])
+            seen.add(symbol)
 
     if q.isdigit() and len(q) == 6:
         for suffix, market in [(".KS", "Korea"), (".KQ", "Korea KOSDAQ")]:
@@ -113,7 +116,7 @@ def search_stock(q: str = Query("")):
             "type": "UNKNOWN"
         })
 
-    return results[:20]
+    return results[:30]
 
 
 @app.get("/api/stock/{symbol}")
@@ -128,10 +131,21 @@ def get_stock(symbol: str, period: str = "1y"):
 
         if hist.empty and symbol.endswith(".KS"):
             alt_symbol = symbol.replace(".KS", ".KQ")
-            ticker = yf.Ticker(alt_symbol)
-            hist = ticker.history(period=period, interval="1d")
-            if not hist.empty:
+            alt_ticker = yf.Ticker(alt_symbol)
+            alt_hist = alt_ticker.history(period=period, interval="1d")
+            if not alt_hist.empty:
                 symbol = alt_symbol
+                ticker = alt_ticker
+                hist = alt_hist
+
+        if hist.empty and symbol.endswith(".KQ"):
+            alt_symbol = symbol.replace(".KQ", ".KS")
+            alt_ticker = yf.Ticker(alt_symbol)
+            alt_hist = alt_ticker.history(period=period, interval="1d")
+            if not alt_hist.empty:
+                symbol = alt_symbol
+                ticker = alt_ticker
+                hist = alt_hist
 
         if hist.empty:
             return {"error": f"No data found for {symbol}"}
@@ -216,7 +230,7 @@ def get_stock(symbol: str, period: str = "1y"):
 
 
 @app.get("/api/module/{module_id}")
-def get_module(module_id: str, symbol: str = "SPY", period: str = "6mo"):
+def get_module(module_id: str, period: str = "6mo"):
     period = validate_period(period)
 
     if module_id == "market":
@@ -513,54 +527,79 @@ def get_krx_stocks():
         return KRX_CACHE
 
     stocks = []
+    seen = set()
 
     if not FDR_AVAILABLE:
         KRX_CACHE = stocks
         return stocks
 
-    try:
-        df = fdr.StockListing("KRX")
+    listing_targets = ["KRX", "ETF/KR"]
 
-        for _, row in df.iterrows():
-            name = str(row.get("Name", "")).strip()
-            code = str(row.get("Code", "")).strip()
-            market = str(row.get("Market", "")).strip()
+    for target in listing_targets:
+        try:
+            df = fdr.StockListing(target)
 
-            if not name or not code:
-                continue
+            for _, row in df.iterrows():
+                name = str(row.get("Name", "") or row.get("NameEng", "") or row.get("Symbol", "")).strip()
+                code = str(row.get("Code", "") or row.get("Symbol", "")).strip()
+                market = str(row.get("Market", "") or target).strip()
 
-            symbol = code + ".KQ" if market == "KOSDAQ" else code + ".KS"
+                if not name or not code:
+                    continue
 
-            stocks.append({
-                "name": name,
-                "symbol": symbol,
-                "market": market or "Korea",
-                "type": "EQUITY"
-            })
+                code = code.zfill(6) if code.isdigit() and len(code) < 6 else code
 
-    except Exception:
-        stocks = []
+                if market == "KOSDAQ":
+                    symbol = code + ".KQ"
+                else:
+                    symbol = code + ".KS"
+
+                key = f"{name}-{symbol}"
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                stocks.append({
+                    "name": name,
+                    "symbol": symbol,
+                    "market": market or "Korea",
+                    "type": "ETF" if target == "ETF/KR" else "EQUITY"
+                })
+
+        except Exception:
+            continue
 
     KRX_CACHE = stocks
     return stocks
 
 
 def search_krx_by_name(q: str):
-    q = q.strip().lower()
+    q_norm = normalize_text(q)
     results = []
 
-    if not q:
+    if not q_norm:
         return results
 
     for item in get_krx_stocks():
-        name = item["name"].lower()
-        symbol = item["symbol"].lower()
-        pure_code = symbol.replace(".ks", "").replace(".kq", "")
+        name = item["name"]
+        symbol = item["symbol"]
+        pure_code = symbol.replace(".KS", "").replace(".KQ", "")
 
-        if q in name or q in symbol or q in pure_code:
+        name_norm = normalize_text(name)
+        symbol_norm = normalize_text(symbol)
+        code_norm = normalize_text(pure_code)
+
+        if (
+            q_norm in name_norm
+            or name_norm in q_norm
+            or q_norm in symbol_norm
+            or q_norm in code_norm
+            or code_norm in q_norm
+        ):
             results.append(item)
 
-        if len(results) >= 20:
+        if len(results) >= 30:
             break
 
     return results
@@ -627,22 +666,39 @@ def normalize_symbol(value: str):
     if value in KOREAN_NAME_MAP:
         return KOREAN_NAME_MAP[value]
 
+    value_norm = normalize_text(value)
+
+    for name, code in KOREAN_NAME_MAP.items():
+        if value_norm == normalize_text(name):
+            return code
+
     if "(" in value and ")" in value:
         start = value.find("(") + 1
         end = value.find(")")
-        return value[start:end].strip()
+        inside = value[start:end].strip()
 
-    if value.isdigit() and len(value) == 6:
-        krx_results = search_krx_by_name(value)
+        krx_results = search_krx_by_name(inside)
         if krx_results:
             return krx_results[0]["symbol"]
+
+        if "." in inside:
+            return inside.upper()
+
+        value_without_paren = value.split("(")[0].strip()
+        krx_results = search_krx_by_name(value_without_paren)
+        if krx_results:
+            return krx_results[0]["symbol"]
+
+        return inside.upper()
+
+    krx_results = search_krx_by_name(value)
+    if krx_results:
+        return krx_results[0]["symbol"]
+
+    if value.isdigit() and len(value) == 6:
         return value + ".KS"
 
     if contains_korean(value):
-        krx_results = search_krx_by_name(value)
-        if krx_results:
-            return krx_results[0]["symbol"]
-
         searched = yahoo_search(value)
         if searched:
             return searched[0]["symbol"]
@@ -654,7 +710,9 @@ def get_display_name(symbol: str, original_input: str = ""):
     original_input = original_input.strip()
 
     if "(" in original_input and ")" in original_input:
-        return original_input.split("(")[0].strip()
+        name_part = original_input.split("(")[0].strip()
+        if name_part:
+            return name_part
 
     if original_input in KOREAN_NAME_MAP:
         return original_input
@@ -672,6 +730,19 @@ def get_display_name(symbol: str, original_input: str = ""):
         return info.get("shortName") or info.get("longName") or symbol
     except Exception:
         return symbol
+
+
+def normalize_text(text: str):
+    return (
+        str(text or "")
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace("/", "")
+        .replace(".", "")
+        .upper()
+        .strip()
+    )
 
 
 def contains_korean(text: str):
