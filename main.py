@@ -1,10 +1,23 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
+import os
+import re
+import math
+import secrets
+import sqlite3
+import smtplib
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Optional
+
 import numpy as np
 import requests
-from datetime import datetime
-import math
+import yfinance as yf
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr
 
 try:
     import FinanceDataReader as fdr
@@ -13,16 +26,404 @@ except Exception:
     FDR_AVAILABLE = False
 
 
-app = FastAPI(title="Alpharion Market Watch API")
+# =========================================================
+# Auth / Runtime Settings
+# =========================================================
+AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "/opt/render/project/src/alpharion_auth.db")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_THIS_SECRET_KEY_ON_RENDER")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "7"))
+VERIFY_TOKEN_EXPIRE_HOURS = int(os.getenv("VERIFY_TOKEN_EXPIRE_HOURS", "24"))
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
+API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+MAIL_FROM_EMAIL = os.getenv("MAIL_FROM_EMAIL", os.getenv("MAIL_FROM", SMTP_USER or "no-reply@alpharion.cloud"))
+MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "Alpharion AI Market Watch")
+
+# bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+
+class SignupRequest(BaseModel):
+    name: Optional[str] = ""
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ResendVerifyRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+def validate_runtime_config():
+    if JWT_SECRET_KEY == "CHANGE_THIS_SECRET_KEY_ON_RENDER":
+        raise RuntimeError("JWT_SECRET_KEY not configured. Set JWT_SECRET_KEY in Render Environment Variables.")
+
+
+def utcnow():
+    return datetime.utcnow()
+
+
+def get_auth_db():
+    db_dir = os.path.dirname(AUTH_DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_auth_db():
+    conn = get_auth_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_verified INTEGER DEFAULT 0,
+            verify_token TEXT,
+            verify_expires_at TEXT,
+            reset_token TEXT,
+            reset_expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_runtime_config()
+    init_auth_db()
+    yield
+
+
+app = FastAPI(title="Alpharion Market Watch API", lifespan=lifespan)
+
+allowed_origins = os.getenv(
+    "CORS_ALLOW_ORIGINS",
+    "https://alpharion.cloud,https://www.alpharion.cloud,http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000",
+).split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in allowed_origins if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# =========================================================
+# Auth Helpers
+# =========================================================
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str):
+    return pwd_context.verify(password, password_hash)
+
+
+def make_token():
+    return secrets.token_urlsafe(32)
+
+
+def create_access_token(user_id: int, email: str):
+    expire = utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    payload = {"sub": str(user_id), "email": email, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def get_user_by_email(email: str):
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (email,)).fetchone()
+    conn.close()
+    return user
+
+
+def get_user_by_id(user_id: int):
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    return user
+
+
+def public_user(user):
+    if not user:
+        return None
+    return {
+        "id": user["id"],
+        "name": user["name"] or "",
+        "email": user["email"],
+        "is_verified": bool(user["is_verified"]),
+        "created_at": user["created_at"],
+    }
+
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print("[AUTH EMAIL DEV MODE] SMTP not configured.")
+        print("TO:", to_email)
+        print("SUBJECT:", subject)
+        print("BODY:", text_body or re.sub("<[^>]+>", "", html_body))
+        return False
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>"
+        msg["To"] = to_email
+        msg.attach(MIMEText(text_body or re.sub("<[^>]+>", "", html_body), "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        if SMTP_USE_TLS:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
+        else:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print("[SMTP ERROR]", repr(e))
+        return False
+
+
+def send_verification_email(email: str, token: str):
+    verify_url = f"{API_PUBLIC_BASE}/api/auth/verify?token={token}"
+    html = f"""
+    <div style="font-family:Arial,sans-serif;line-height:1.7;color:#111827">
+      <h2>Alpharion AI 이메일 인증</h2>
+      <p>아래 버튼을 클릭하면 이메일 인증이 완료됩니다.</p>
+      <p><a href="{verify_url}" style="display:inline-block;background:#22c55e;color:white;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:bold">이메일 인증하기</a></p>
+      <p>버튼이 작동하지 않으면 아래 주소를 브라우저에 붙여넣어 주세요.</p>
+      <p>{verify_url}</p>
+    </div>
+    """
+    text = f"Alpharion AI 이메일 인증 링크: {verify_url}"
+    return send_email(email, "[Alpharion AI] 이메일 인증을 완료해주세요", html, text)
+
+
+def send_password_reset_email(email: str, token: str):
+    reset_url = f"{FRONTEND_BASE_URL}/?reset_token={token}"
+    html = f"""
+    <div style="font-family:Arial,sans-serif;line-height:1.7;color:#111827">
+      <h2>Alpharion AI 비밀번호 재설정</h2>
+      <p>아래 링크로 접속해 새 비밀번호를 설정하세요.</p>
+      <p>{reset_url}</p>
+    </div>
+    """
+    text = f"Alpharion AI 비밀번호 재설정 링크: {reset_url}"
+    return send_email(email, "[Alpharion AI] 비밀번호 재설정", html, text)
+
+
+# =========================================================
+# Auth API
+# =========================================================
+@app.post("/api/auth/signup")
+def auth_signup(req: SignupRequest):
+    email = req.email.strip().lower()
+    name = (req.name or "").strip()
+    password = req.password or ""
+
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="비밀번호는 최소 6자 이상이어야 합니다.")
+    if len(password.encode("utf-8")) > 512:
+        raise HTTPException(status_code=400, detail="비밀번호가 너무 깁니다. 512바이트 이하로 입력해주세요.")
+
+    existing = get_user_by_email(email)
+    if existing:
+        raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다.")
+
+    verify_token = make_token()
+    expires = utcnow() + timedelta(hours=VERIFY_TOKEN_EXPIRE_HOURS)
+    now = utcnow().isoformat()
+
+    conn = get_auth_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO users (name, email, password_hash, is_verified, verify_token, verify_expires_at, created_at, updated_at)
+        VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+        """,
+        (name, email, hash_password(password), verify_token, expires.isoformat(), now, now),
+    )
+    conn.commit()
+    user_id = cur.lastrowid
+    conn.close()
+
+    email_sent = send_verification_email(email, verify_token)
+    return {
+        "ok": True,
+        "message": "회원가입이 완료되었습니다. 이메일 인증 링크를 확인해주세요.",
+        "email_sent": email_sent,
+        "user": {"id": user_id, "name": name, "email": email, "is_verified": False},
+    }
+
+
+@app.get("/api/auth/verify")
+def auth_verify(token: str):
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE verify_token=?", (token,)).fetchone()
+
+    if not user:
+        conn.close()
+        return {"ok": False, "message": "인증 링크가 올바르지 않습니다.", "login_url": FRONTEND_BASE_URL}
+
+    exp = datetime.fromisoformat(user["verify_expires_at"])
+    if exp < utcnow():
+        conn.close()
+        return {"ok": False, "message": "인증 링크가 만료되었습니다. 인증메일을 다시 요청해주세요.", "login_url": FRONTEND_BASE_URL}
+
+    conn.execute(
+        "UPDATE users SET is_verified=1, verify_token=NULL, verify_expires_at=NULL, updated_at=? WHERE id=?",
+        (utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "이메일 인증이 완료되었습니다. Alpharion AI 페이지로 돌아가 로그인해주세요.", "login_url": FRONTEND_BASE_URL}
+
+
+@app.post("/api/auth/resend-verification")
+def auth_resend(req: ResendVerifyRequest):
+    email = req.email.strip().lower()
+    user = get_user_by_email(email)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="가입되지 않은 이메일입니다.")
+    if user["is_verified"]:
+        return {"ok": True, "message": "이미 이메일 인증이 완료된 계정입니다."}
+
+    token = make_token()
+    expires = utcnow() + timedelta(hours=VERIFY_TOKEN_EXPIRE_HOURS)
+    conn = get_auth_db()
+    conn.execute(
+        "UPDATE users SET verify_token=?, verify_expires_at=?, updated_at=? WHERE id=?",
+        (token, expires.isoformat(), utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    email_sent = send_verification_email(email, token)
+    return {"ok": True, "message": "인증메일을 다시 보냈습니다.", "email_sent": email_sent}
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginRequest):
+    email = req.email.strip().lower()
+    user = get_user_by_email(email)
+
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
+    if not user["is_verified"]:
+        raise HTTPException(status_code=403, detail="이메일 인증이 필요합니다. 메일함에서 인증 링크를 확인해주세요.")
+
+    token = create_access_token(user["id"], user["email"])
+    return {"ok": True, "access_token": token, "token_type": "bearer", "user": public_user(user)}
+
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except (JWTError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="로그인 토큰이 올바르지 않습니다.")
+
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
+    return user
+
+
+@app.get("/api/auth/me")
+def auth_me(user=Depends(get_current_user)):
+    return {"ok": True, "user": public_user(user)}
+
+
+@app.post("/api/auth/request-password-reset")
+def auth_request_password_reset(req: PasswordResetRequest):
+    email = req.email.strip().lower()
+    user = get_user_by_email(email)
+    if not user:
+        return {"ok": True, "message": "가입된 이메일인 경우 비밀번호 재설정 메일을 보냅니다."}
+
+    token = make_token()
+    expires = utcnow() + timedelta(hours=2)
+    conn = get_auth_db()
+    conn.execute(
+        "UPDATE users SET reset_token=?, reset_expires_at=?, updated_at=? WHERE id=?",
+        (token, expires.isoformat(), utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    send_password_reset_email(email, token)
+    return {"ok": True, "message": "가입된 이메일인 경우 비밀번호 재설정 메일을 보냅니다."}
+
+
+@app.post("/api/auth/reset-password")
+def auth_reset_password(req: PasswordResetConfirmRequest):
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="새 비밀번호는 최소 6자 이상이어야 합니다.")
+    if len(req.new_password.encode("utf-8")) > 512:
+        raise HTTPException(status_code=400, detail="새 비밀번호가 너무 깁니다. 512바이트 이하로 입력해주세요.")
+
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE reset_token=?", (req.token,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=400, detail="비밀번호 재설정 링크가 올바르지 않습니다.")
+
+    exp = datetime.fromisoformat(user["reset_expires_at"])
+    if exp < utcnow():
+        conn.close()
+        raise HTTPException(status_code=400, detail="비밀번호 재설정 링크가 만료되었습니다.")
+
+    conn.execute(
+        "UPDATE users SET password_hash=?, reset_token=NULL, reset_expires_at=NULL, updated_at=? WHERE id=?",
+        (hash_password(req.new_password), utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "비밀번호가 변경되었습니다. 다시 로그인해주세요."}
+
+
+# =========================================================
+# Stock / Market API
+# =========================================================
 KOREAN_NAME_MAP = {
     "삼성전자": "005930.KS",
     "SK하이닉스": "000660.KS",
@@ -50,11 +451,7 @@ KRX_CACHE = None
 
 @app.get("/")
 def root():
-    return {
-        "service": "Alpharion Market Watch",
-        "company": "CodeGeneva Inc.",
-        "status": "running"
-    }
+    return {"service": "Alpharion Market Watch", "company": "CodeGeneva Inc.", "status": "running"}
 
 
 @app.get("/health")
@@ -64,10 +461,6 @@ def health():
 
 @app.get("/api/news")
 def get_market_issue_news():
-    """
-    특정 종목 뉴스가 아니라, 현재 시장에서 이슈가 되는 증권/경제/섹터 뉴스를 수집합니다.
-    Yahoo Finance Search API의 newsCount 기능을 이용합니다.
-    """
     queries = [
         "stock market today",
         "market movers",
@@ -78,7 +471,7 @@ def get_market_issue_news():
         "Korea stock market",
         "global markets today",
         "earnings stock market",
-        "ETF market trends"
+        "ETF market trends",
     ]
 
     collected = []
@@ -93,36 +486,35 @@ def get_market_issue_news():
             title_key = normalize_text(title)
             if title_key in seen_titles:
                 continue
-
             seen_titles.add(title_key)
 
-            collected.append({
-                "category": classify_market_news(title),
-                "symbol": item.get("related", "Market"),
-                "title": title,
-                "publisher": item.get("publisher", "Market News"),
-                "link": item.get("link", ""),
-                "date": item.get("date", ""),
-                "summary": make_news_summary(title),
-                "importance": score_market_news(title)
-            })
+            collected.append(
+                {
+                    "category": classify_market_news(title),
+                    "symbol": item.get("related", "Market"),
+                    "title": title,
+                    "publisher": item.get("publisher", "Market News"),
+                    "link": item.get("link", ""),
+                    "date": item.get("date", ""),
+                    "summary": make_news_summary(title),
+                    "importance": score_market_news(title),
+                }
+            )
 
     collected = sorted(collected, key=lambda x: x.get("importance", 0), reverse=True)
-
     if not collected:
         collected = fallback_market_news()
 
     return {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "Yahoo Finance market issue search",
-        "items": collected[:18]
+        "items": collected[:18],
     }
 
 
 @app.get("/api/search")
 def search_stock(q: str = Query("")):
     q = q.strip()
-
     if not q:
         return []
 
@@ -131,12 +523,7 @@ def search_stock(q: str = Query("")):
 
     for name, symbol in KOREAN_NAME_MAP.items():
         if normalize_text(q) in normalize_text(name) or normalize_text(q) in normalize_text(symbol):
-            item = {
-                "name": name,
-                "symbol": symbol,
-                "market": "Korea",
-                "type": "EQUITY"
-            }
+            item = {"name": name, "symbol": symbol, "market": "Korea", "type": "EQUITY"}
             results.append(item)
             seen.add(symbol)
 
@@ -150,12 +537,7 @@ def search_stock(q: str = Query("")):
         for suffix, market in [(".KS", "Korea"), (".KQ", "Korea KOSDAQ")]:
             symbol = q + suffix
             if symbol not in seen:
-                results.append({
-                    "name": q,
-                    "symbol": symbol,
-                    "market": market,
-                    "type": "EQUITY"
-                })
+                results.append({"name": q, "symbol": symbol, "market": market, "type": "EQUITY"})
                 seen.add(symbol)
 
     for item in yahoo_search(q):
@@ -166,12 +548,7 @@ def search_stock(q: str = Query("")):
 
     if not results:
         guessed = normalize_symbol(q)
-        results.append({
-            "name": guessed,
-            "symbol": guessed,
-            "market": "Direct Ticker",
-            "type": "UNKNOWN"
-        })
+        results.append({"name": guessed, "symbol": guessed, "market": "Direct Ticker", "type": "UNKNOWN"})
 
     return results[:30]
 
@@ -208,7 +585,6 @@ def get_stock(symbol: str, period: str = "1y"):
             return {"error": f"No data found for {symbol}"}
 
         hist = hist.dropna()
-
         dates = [idx.strftime("%Y-%m-%d") for idx in hist.index]
         open_prices = hist["Open"].tolist()
         high_prices = hist["High"].tolist()
@@ -234,13 +610,12 @@ def get_stock(symbol: str, period: str = "1y"):
 
         forecast = ai_momentum_forecast(close_prices)
         news = safe_news_sentiment(ticker)
-
         auto_signal = automatic_buy_signal(
             rsi=rsi,
             period_change=period_change,
             daily_change=daily_change,
             forecast_change=forecast["forecast_change_pct"],
-            news_score=news["score"]
+            news_score=news["score"],
         )
 
         return {
@@ -279,9 +654,8 @@ def get_stock(symbol: str, period: str = "1y"):
                 "auto_signal": auto_signal["text"],
                 "market_summary": f"{display_name}의 현재가는 {round(float(last), 2)}이며, 선택 기간 수익률은 {round(float(period_change), 2)}%입니다. 현재 신호는 '{auto_signal['label']}'입니다.",
             },
-            "news": news["items"]
+            "news": news["items"],
         }
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -289,7 +663,6 @@ def get_stock(symbol: str, period: str = "1y"):
 @app.get("/api/module/{module_id}")
 def get_module(module_id: str, period: str = "6mo"):
     period = validate_period(period)
-
     if module_id == "market":
         return market_overview(period)
     if module_id == "fundamental":
@@ -304,26 +677,21 @@ def get_module(module_id: str, period: str = "6mo"):
         return sector_momentum(period)
     if module_id == "market_value":
         return market_value(period)
-
     return {"error": "Unknown module"}
 
 
+# =========================================================
+# Market / Data Helpers
+# =========================================================
 def yahoo_market_news_search(query: str):
     try:
         url = "https://query1.finance.yahoo.com/v1/finance/search"
-        params = {
-            "q": query,
-            "quotesCount": 0,
-            "newsCount": 8,
-            "enableFuzzyQuery": "true"
-        }
+        params = {"q": query, "quotesCount": 0, "newsCount": 8, "enableFuzzyQuery": "true"}
         headers = {"User-Agent": "Mozilla/5.0"}
-
         res = requests.get(url, params=params, headers=headers, timeout=8)
         data = res.json()
 
         results = []
-
         for item in data.get("news", []):
             title = item.get("title", "") or ""
             publisher = item.get("publisher", "") or ""
@@ -338,23 +706,22 @@ def yahoo_market_news_search(query: str):
                 except Exception:
                     date_text = ""
 
-            results.append({
-                "title": title,
-                "publisher": publisher,
-                "link": link,
-                "date": date_text,
-                "related": ", ".join(related[:3]) if isinstance(related, list) else "Market"
-            })
-
+            results.append(
+                {
+                    "title": title,
+                    "publisher": publisher,
+                    "link": link,
+                    "date": date_text,
+                    "related": ", ".join(related[:3]) if isinstance(related, list) else "Market",
+                }
+            )
         return results
-
     except Exception:
         return []
 
 
 def classify_market_news(title: str):
     t = title.lower()
-
     if any(w in t for w in ["fed", "rate", "inflation", "yield", "treasury"]):
         return "금리·인플레이션"
     if any(w in t for w in ["ai", "nvidia", "semiconductor", "chip", "tech"]):
@@ -367,40 +734,27 @@ def classify_market_news(title: str):
         return "시장 전체"
     if any(w in t for w in ["korea", "kospi", "won", "samsung"]):
         return "한국시장"
-
     return "시장 이슈"
 
 
 def score_market_news(title: str):
     t = title.lower()
-
     score = 0
-
     high_keywords = [
-        "fed", "inflation", "rate", "nasdaq", "s&p", "ai", "nvidia",
-        "semiconductor", "earnings", "market", "oil", "bond", "yield",
-        "tariff", "china", "recession", "rally", "selloff"
+        "fed", "inflation", "rate", "nasdaq", "s&p", "ai", "nvidia", "semiconductor", "earnings", "market", "oil", "bond", "yield", "tariff", "china", "recession", "rally", "selloff",
     ]
-
-    medium_keywords = [
-        "stocks", "etf", "dollar", "gold", "korea", "kospi",
-        "growth", "profit", "revenue", "forecast"
-    ]
-
+    medium_keywords = ["stocks", "etf", "dollar", "gold", "korea", "kospi", "growth", "profit", "revenue", "forecast"]
     for word in high_keywords:
         if word in t:
             score += 3
-
     for word in medium_keywords:
         if word in t:
             score += 1
-
     return score
 
 
 def make_news_summary(title: str):
     category = classify_market_news(title)
-
     if category == "금리·인플레이션":
         return "금리, 물가, 채권금리 변화는 성장주와 위험자산 선호도에 직접적인 영향을 줄 수 있습니다."
     if category == "AI·반도체":
@@ -411,7 +765,6 @@ def make_news_summary(title: str):
         return "기업 실적과 가이던스는 개별 종목뿐 아니라 해당 섹터의 밸류에이션에도 영향을 줄 수 있습니다."
     if category == "한국시장":
         return "한국시장 관련 이슈는 환율, 외국인 수급, 반도체·자동차·2차전지 섹터와 함께 확인할 필요가 있습니다."
-
     return "시장 전반의 투자심리와 자금 흐름에 영향을 줄 수 있는 이슈입니다."
 
 
@@ -425,25 +778,16 @@ def fallback_market_news():
             "link": "",
             "date": datetime.now().strftime("%Y-%m-%d"),
             "summary": "잠시 후 다시 시도하면 시장 이슈 뉴스가 표시됩니다.",
-            "importance": 0
+            "importance": 0,
         }
     ]
 
 
 def market_overview(period):
-    items = {
-        "S&P 500": "^GSPC",
-        "NASDAQ": "^IXIC",
-        "KOSPI": "^KS11",
-        "KOSDAQ": "^KQ11",
-        "USD/KRW": "KRW=X",
-        "WTI": "CL=F",
-    }
-
+    items = {"S&P 500": "^GSPC", "NASDAQ": "^IXIC", "KOSPI": "^KS11", "KOSDAQ": "^KQ11", "USD/KRW": "KRW=X", "WTI": "CL=F"}
     rows, labels, values = build_metric_rows(items, period)
     avg = safe_mean(values)
     sentiment = "긍정" if avg > 0.8 else "부정" if avg < -0.8 else "중립"
-
     return {
         "title": "시황",
         "subtitle": f"{period_label(period)} 기준 주요 지수·환율·원자재 시장 심리 요약",
@@ -461,23 +805,15 @@ def market_overview(period):
             {"title": "확인 포인트", "text": "상승 지표와 하락 지표의 비율을 확인해 단기 시장 방향성을 점검해야 합니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
+        "chart": {"labels": labels, "values": values, "label": "변동률 (%)"},
     }
 
 
 def market_fundamental(period):
-    items = {
-        "S&P 500 ETF": "SPY",
-        "NASDAQ ETF": "QQQ",
-        "Korea ETF": "EWY",
-        "US Value ETF": "VTV",
-        "US Growth ETF": "VUG",
-    }
-
+    items = {"S&P 500 ETF": "SPY", "NASDAQ ETF": "QQQ", "Korea ETF": "EWY", "US Value ETF": "VTV", "US Growth ETF": "VUG"}
     rows, labels, values = build_metric_rows(items, period)
     avg = safe_mean(values)
     status = "양호" if avg > 5 else "보통" if avg > -5 else "약화"
-
     return {
         "title": "펀더멘털",
         "subtitle": f"{period_label(period)} 기준 시장 ETF 기반 체력 진단",
@@ -495,24 +831,16 @@ def market_fundamental(period):
             {"title": "한국시장 위치", "text": "EWY 흐름을 미국 주요 ETF와 비교하면 한국 시장의 상대 강도를 볼 수 있습니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"},
     }
 
 
 def market_signal(period):
-    items = {
-        "S&P 500": "^GSPC",
-        "NASDAQ": "^IXIC",
-        "KOSPI": "^KS11",
-        "KOSDAQ": "^KQ11",
-        "Russell 2000": "^RUT",
-    }
-
+    items = {"S&P 500": "^GSPC", "NASDAQ": "^IXIC", "KOSPI": "^KS11", "KOSDAQ": "^KQ11", "Russell 2000": "^RUT"}
     rows, labels, values = build_metric_rows(items, period)
     positive_count = len([v for v in values if v > 0])
     negative_count = len([v for v in values if v < 0])
     signal = "상승 우위" if positive_count > negative_count else "하락 경계" if negative_count > positive_count else "중립"
-
     return {
         "title": "신호",
         "subtitle": f"{period_label(period)} 기준 시장 지수 상승·하락 신호",
@@ -530,22 +858,14 @@ def market_signal(period):
             {"title": "주의 구간", "text": "일부 대형 지수만 상승하고 중소형 지수가 약하면 상승 지속성을 확인해야 합니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"},
     }
 
 
 def macro_monitoring(period):
-    items = {
-        "US 10Y Yield": "^TNX",
-        "Dollar Index": "DX-Y.NYB",
-        "WTI Oil": "CL=F",
-        "Gold": "GC=F",
-        "USD/KRW": "KRW=X",
-    }
-
+    items = {"US 10Y Yield": "^TNX", "Dollar Index": "DX-Y.NYB", "WTI Oil": "CL=F", "Gold": "GC=F", "USD/KRW": "KRW=X"}
     rows, labels, values = build_metric_rows(items, period)
     risk_score = len([v for v in values if v > 1])
-
     return {
         "title": "거시경제",
         "subtitle": f"{period_label(period)} 기준 금리·환율·원자재 모니터링",
@@ -563,7 +883,7 @@ def macro_monitoring(period):
             {"title": "원자재 분석", "text": "유가와 금 가격은 인플레이션 및 위험회피 심리 판단에 활용됩니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "변동률 (%)"}
+        "chart": {"labels": labels, "values": values, "label": "변동률 (%)"},
     }
 
 
@@ -571,7 +891,6 @@ def sector_valuation(period):
     items = sector_items()
     rows, labels, values = build_metric_rows(items, period)
     best = labels[int(np.argmax(values))] if values else "-"
-
     return {
         "title": "섹터 밸류에이션",
         "subtitle": f"{period_label(period)} 기준 섹터 ETF 상대 성과",
@@ -589,7 +908,7 @@ def sector_valuation(period):
             {"title": "분산 확인", "text": "특정 섹터만 강하면 순환매인지, 구조적 강세인지 추가 확인이 필요합니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"},
     }
 
 
@@ -598,7 +917,6 @@ def sector_momentum(period):
     rows, labels, values = build_metric_rows(items, period)
     ranked = sorted(zip(labels, values), key=lambda x: x[1], reverse=True)
     leader = ranked[0][0] if ranked else "-"
-
     return {
         "title": "섹터 모멘텀",
         "subtitle": f"{period_label(period)} 기준 섹터 수익률 랭킹",
@@ -616,23 +934,15 @@ def sector_momentum(period):
             {"title": "추세 지속성", "text": "1개월과 6개월 모두 강한 섹터는 추세 지속 가능성을 더 높게 볼 수 있습니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"},
     }
 
 
 def market_value(period):
-    items = {
-        "SPY": "SPY",
-        "QQQ": "QQQ",
-        "DIA": "DIA",
-        "IWM": "IWM",
-        "EWY": "EWY",
-    }
-
+    items = {"SPY": "SPY", "QQQ": "QQQ", "DIA": "DIA", "IWM": "IWM", "EWY": "EWY"}
     rows, labels, values = build_metric_rows(items, period)
     avg = safe_mean(values)
     valuation = "고평가 경계" if avg > 15 else "중립" if avg > -5 else "저평가 가능성"
-
     return {
         "title": "시장 밸류",
         "subtitle": f"{period_label(period)} 기준 주요 ETF 고·저평가 점검",
@@ -650,7 +960,7 @@ def market_value(period):
             {"title": "저평가 가능성", "text": "장기 하락 이후 회복 신호가 나타나면 저평가 반등 가능성을 점검할 수 있습니다."},
         ],
         "rows": rows,
-        "chart": {"labels": labels, "values": values, "label": "Return (%)"}
+        "chart": {"labels": labels, "values": values, "label": "Return (%)"},
     }
 
 
@@ -671,13 +981,11 @@ def build_metric_rows(items, period):
     rows = []
     labels = []
     values = []
-
     for name, symbol in items.items():
         metric = quick_metric(symbol, period)
         rows.append({"name": name, "value": metric["text"]})
         labels.append(name)
         values.append(metric["change"])
-
     return rows, labels, values
 
 
@@ -686,66 +994,42 @@ def quick_metric(symbol, period="1mo"):
         hist = yf.Ticker(symbol).history(period=period, interval="1d").dropna()
         if hist.empty:
             return {"change": 0, "text": "데이터 없음"}
-
         first = float(hist["Close"].iloc[0])
         last = float(hist["Close"].iloc[-1])
         change = ((last - first) / first) * 100
-
-        return {
-            "change": round(change, 2),
-            "text": f"{round(last, 2)} / {round(change, 2)}%"
-        }
+        return {"change": round(change, 2), "text": f"{round(last, 2)} / {round(change, 2)}%"}
     except Exception:
         return {"change": 0, "text": "데이터 없음"}
 
 
 def get_krx_stocks():
     global KRX_CACHE
-
     if KRX_CACHE is not None:
         return KRX_CACHE
 
     stocks = []
     seen = set()
-
     if not FDR_AVAILABLE:
         KRX_CACHE = stocks
         return stocks
 
-    listing_targets = ["KRX", "ETF/KR"]
-
-    for target in listing_targets:
+    for target in ["KRX", "ETF/KR"]:
         try:
             df = fdr.StockListing(target)
-
             for _, row in df.iterrows():
                 name = str(row.get("Name", "") or row.get("NameEng", "") or row.get("Symbol", "")).strip()
                 code = str(row.get("Code", "") or row.get("Symbol", "")).strip()
                 market = str(row.get("Market", "") or target).strip()
-
                 if not name or not code:
                     continue
 
                 code = code.zfill(6) if code.isdigit() and len(code) < 6 else code
-
-                if market == "KOSDAQ":
-                    symbol = code + ".KQ"
-                else:
-                    symbol = code + ".KS"
-
+                symbol = code + ".KQ" if market == "KOSDAQ" else code + ".KS"
                 key = f"{name}-{symbol}"
                 if key in seen:
                     continue
-
                 seen.add(key)
-
-                stocks.append({
-                    "name": name,
-                    "symbol": symbol,
-                    "market": market or "Korea",
-                    "type": "ETF" if target == "ETF/KR" else "EQUITY"
-                })
-
+                stocks.append({"name": name, "symbol": symbol, "market": market or "Korea", "type": "ETF" if target == "ETF/KR" else "EQUITY"})
         except Exception:
             continue
 
@@ -756,7 +1040,6 @@ def get_krx_stocks():
 def search_krx_by_name(q: str):
     q_norm = normalize_text(q)
     results = []
-
     if not q_norm:
         return results
 
@@ -764,58 +1047,33 @@ def search_krx_by_name(q: str):
         name = item["name"]
         symbol = item["symbol"]
         pure_code = symbol.replace(".KS", "").replace(".KQ", "")
-
         name_norm = normalize_text(name)
         symbol_norm = normalize_text(symbol)
         code_norm = normalize_text(pure_code)
 
-        if (
-            q_norm in name_norm
-            or name_norm in q_norm
-            or q_norm in symbol_norm
-            or q_norm in code_norm
-            or code_norm in q_norm
-        ):
+        if q_norm in name_norm or name_norm in q_norm or q_norm in symbol_norm or q_norm in code_norm or code_norm in q_norm:
             results.append(item)
-
         if len(results) >= 30:
             break
-
     return results
 
 
 def yahoo_search(q: str):
     try:
         url = "https://query1.finance.yahoo.com/v1/finance/search"
-        params = {
-            "q": q,
-            "quotesCount": 20,
-            "newsCount": 0,
-            "enableFuzzyQuery": "true"
-        }
+        params = {"q": q, "quotesCount": 20, "newsCount": 0, "enableFuzzyQuery": "true"}
         headers = {"User-Agent": "Mozilla/5.0"}
-
         res = requests.get(url, params=params, headers=headers, timeout=8)
         data = res.json()
-
         results = []
-
         for item in data.get("quotes", []):
             symbol = item.get("symbol")
             name = item.get("shortname") or item.get("longname") or item.get("name")
             exchange = item.get("exchange") or item.get("exchDisp") or "Unknown"
             quote_type = item.get("quoteType", "")
-
             if symbol:
-                results.append({
-                    "name": name or symbol,
-                    "symbol": symbol,
-                    "market": exchange,
-                    "type": quote_type
-                })
-
+                results.append({"name": name or symbol, "symbol": symbol, "market": exchange, "type": quote_type})
         return results
-
     except Exception:
         return []
 
@@ -826,27 +1084,16 @@ def validate_period(period: str):
 
 
 def period_label(period: str):
-    labels = {
-        "1mo": "1개월",
-        "3mo": "3개월",
-        "6mo": "6개월",
-        "1y": "1년",
-        "2y": "2년",
-        "5y": "5년",
-        "10y": "10년",
-        "max": "전체 기간",
-    }
+    labels = {"1mo": "1개월", "3mo": "3개월", "6mo": "6개월", "1y": "1년", "2y": "2년", "5y": "5년", "10y": "10년", "max": "전체 기간"}
     return labels.get(period, "1년")
 
 
 def normalize_symbol(value: str):
     value = value.strip()
-
     if value in KOREAN_NAME_MAP:
         return KOREAN_NAME_MAP[value]
 
     value_norm = normalize_text(value)
-
     for name, code in KOREAN_NAME_MAP.items():
         if value_norm == normalize_text(name):
             return code
@@ -855,19 +1102,15 @@ def normalize_symbol(value: str):
         start = value.find("(") + 1
         end = value.find(")")
         inside = value[start:end].strip()
-
         krx_results = search_krx_by_name(inside)
         if krx_results:
             return krx_results[0]["symbol"]
-
         if "." in inside:
             return inside.upper()
-
         value_without_paren = value.split("(")[0].strip()
         krx_results = search_krx_by_name(value_without_paren)
         if krx_results:
             return krx_results[0]["symbol"]
-
         return inside.upper()
 
     krx_results = search_krx_by_name(value)
@@ -876,34 +1119,27 @@ def normalize_symbol(value: str):
 
     if value.isdigit() and len(value) == 6:
         return value + ".KS"
-
     if contains_korean(value):
         searched = yahoo_search(value)
         if searched:
             return searched[0]["symbol"]
-
     return value.upper()
 
 
 def get_display_name(symbol: str, original_input: str = ""):
     original_input = original_input.strip()
-
     if "(" in original_input and ")" in original_input:
         name_part = original_input.split("(")[0].strip()
         if name_part:
             return name_part
-
     if original_input in KOREAN_NAME_MAP:
         return original_input
-
     for name, code in KOREAN_NAME_MAP.items():
         if code == symbol:
             return name
-
     for item in get_krx_stocks():
         if item["symbol"] == symbol:
             return item["name"]
-
     try:
         info = yf.Ticker(symbol).info or {}
         return info.get("shortName") or info.get("longName") or symbol
@@ -912,16 +1148,7 @@ def get_display_name(symbol: str, original_input: str = ""):
 
 
 def normalize_text(text: str):
-    return (
-        str(text or "")
-        .replace(" ", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace("/", "")
-        .replace(".", "")
-        .upper()
-        .strip()
-    )
+    return str(text or "").replace(" ", "").replace("-", "").replace("_", "").replace("/", "").replace(".", "").upper().strip()
 
 
 def contains_korean(text: str):
@@ -937,47 +1164,38 @@ def is_bad_number(x):
 
 def clean_list(values):
     cleaned = []
-
     for x in values:
         if is_bad_number(x):
             cleaned.append(None)
         else:
             cleaned.append(round(float(x), 2))
-
     return cleaned
 
 
 def moving_average(values, window):
     result = []
-
     for i in range(len(values)):
         if i + 1 < window:
             result.append(None)
         else:
-            avg = np.mean(values[i + 1 - window:i + 1])
+            avg = np.mean(values[i + 1 - window : i + 1])
             result.append(round(float(avg), 2))
-
     return result
 
 
 def calculate_rsi(values, period=14):
     if len(values) < period + 1:
         return 50.0
-
     gains = []
     losses = []
-
     for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0))
         losses.append(abs(min(diff, 0)))
-
     avg_gain = np.mean(gains[-period:])
     avg_loss = np.mean(losses[-period:])
-
     if avg_loss == 0:
         return 100.0
-
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -985,27 +1203,17 @@ def calculate_rsi(values, period=14):
 def ai_momentum_forecast(values):
     last_price = float(values[-1])
     recent = values[-30:] if len(values) >= 30 else values
-
     if len(recent) < 2:
-        return {
-            "forecast_price": last_price,
-            "forecast_change_pct": 0.0,
-            "text": "데이터가 부족하여 예측을 보류합니다."
-        }
+        return {"forecast_price": last_price, "forecast_change_pct": 0.0, "text": "데이터가 부족하여 예측을 보류합니다."}
 
     momentum = ((recent[-1] - recent[0]) / recent[0]) * 100
     volatility = np.std(np.diff(recent)) / np.mean(recent) * 100
-
     forecast_change = momentum * 0.55 - volatility * 0.2
     forecast_price = last_price * (1 + forecast_change / 100)
-
     return {
         "forecast_price": forecast_price,
         "forecast_change_pct": forecast_change,
-        "text": (
-            f"AI 기반 30일 예측은 최근 가격 모멘텀과 변동성을 반영했습니다. "
-            f"예상 가격은 약 {forecast_price:.2f}, 현재가 대비 예상 변화율은 {forecast_change:.2f}%입니다."
-        )
+        "text": f"AI 기반 30일 예측은 최근 가격 모멘텀과 변동성을 반영했습니다. 예상 가격은 약 {forecast_price:.2f}, 현재가 대비 예상 변화율은 {forecast_change:.2f}%입니다.",
     }
 
 
@@ -1013,84 +1221,49 @@ def safe_news_sentiment(ticker):
     try:
         return news_sentiment(ticker)
     except Exception:
-        return {
-            "score": 0,
-            "label": "중립",
-            "items": [],
-            "text": "뉴스 데이터를 가져오지 못했습니다."
-        }
+        return {"score": 0, "label": "중립", "items": [], "text": "뉴스 데이터를 가져오지 못했습니다."}
 
 
 def news_sentiment(ticker):
-    positive_words = [
-        "beat", "growth", "strong", "surge", "record", "upgrade",
-        "profit", "bullish", "gain", "ai", "demand"
-    ]
-
-    negative_words = [
-        "miss", "fall", "drop", "weak", "downgrade", "loss",
-        "bearish", "risk", "lawsuit", "cut", "slowdown", "concern"
-    ]
-
-    items = []
+    positive_words = ["beat", "growth", "strong", "surge", "record", "upgrade", "profit", "bullish", "gain", "ai", "demand"]
+    negative_words = ["miss", "fall", "drop", "weak", "downgrade", "loss", "bearish", "risk", "lawsuit", "cut", "slowdown", "concern"]
 
     try:
         news_list = ticker.news or []
     except Exception:
         news_list = []
 
+    items = []
     score = 0
-
     for n in news_list[:8]:
         title = n.get("title", "") or ""
         publisher = n.get("publisher", "") or ""
         link = n.get("link", "") or ""
         published = n.get("providerPublishTime", None)
-
         title_lower = title.lower()
 
         for w in positive_words:
             if w in title_lower:
                 score += 1
-
         for w in negative_words:
             if w in title_lower:
                 score -= 1
 
         date_text = ""
-
         if published:
             try:
                 date_text = datetime.fromtimestamp(published).strftime("%Y-%m-%d")
             except Exception:
                 date_text = ""
-
         if title:
-            items.append({
-                "title": title,
-                "publisher": publisher,
-                "link": link,
-                "date": date_text
-            })
+            items.append({"title": title, "publisher": publisher, "link": link, "date": date_text})
 
-    if score >= 2:
-        label = "긍정"
-    elif score <= -2:
-        label = "부정"
-    else:
-        label = "중립"
-
-    return {
-        "score": score,
-        "label": label,
-        "items": items,
-        "text": f"최근 뉴스 헤드라인 기준 감성 점수는 {score}점이며, 종합 판단은 '{label}'입니다."
-    }
+    label = "긍정" if score >= 2 else "부정" if score <= -2 else "중립"
+    return {"score": score, "label": label, "items": items, "text": f"최근 뉴스 헤드라인 기준 감성 점수는 {score}점이며, 종합 판단은 '{label}'입니다."}
 
 
 def automatic_buy_signal(rsi, period_change, daily_change, forecast_change, news_score):
     score = 0
-
     if rsi < 35:
         score += 2
     elif 35 <= rsi <= 60:
@@ -1105,10 +1278,7 @@ def automatic_buy_signal(rsi, period_change, daily_change, forecast_change, news
     elif period_change < -10:
         score -= 2
 
-    if daily_change > 0:
-        score += 1
-    else:
-        score -= 1
+    score += 1 if daily_change > 0 else -1
 
     if forecast_change > 5:
         score += 2
@@ -1131,33 +1301,20 @@ def automatic_buy_signal(rsi, period_change, daily_change, forecast_change, news
     else:
         label = "관망"
 
-    return {
-        "score": score,
-        "label": label,
-        "text": (
-            f"자동 매수 신호 점수는 {score}점입니다. "
-            f"RSI, 기간 수익률, 단기 변동률, AI 30일 예측, 뉴스 감성 점수를 종합하여 '{label}'로 판단했습니다."
-        )
-    }
+    return {"score": score, "label": label, "text": f"자동 매수 신호 점수는 {score}점입니다. RSI, 기간 수익률, 단기 변동률, AI 30일 예측, 뉴스 감성 점수를 종합하여 '{label}'로 판단했습니다."}
 
 
 def make_technical_text(name, rsi, period_change, daily_change):
-    return (
-        f"{name}는 선택 기간 기준 {period_change:.2f}% 변동했습니다. "
-        f"RSI는 {rsi:.1f}이며, 직전 거래일 대비 변동률은 {daily_change:.2f}%입니다."
-    )
+    return f"{name}는 선택 기간 기준 {period_change:.2f}% 변동했습니다. RSI는 {rsi:.1f}이며, 직전 거래일 대비 변동률은 {daily_change:.2f}%입니다."
 
 
 def make_pattern_text(period_change, rsi):
     if period_change > 10:
         return "선택 기간 동안 우상향 흐름이 나타납니다. 추세 지속형 패턴 또는 신고가 돌파 가능성을 확인해야 합니다."
-
     if period_change < -10:
         return "약세 흐름이 나타납니다. 지지선 이탈 여부와 거래량 증가 여부를 확인해야 합니다."
-
     if 45 <= rsi <= 60:
         return "강한 방향성보다는 박스권 또는 횡보 패턴 가능성이 있습니다."
-
     return "현재 구간은 뚜렷한 패턴보다 변동성 확인이 우선입니다."
 
 
