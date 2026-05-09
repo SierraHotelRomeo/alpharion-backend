@@ -62,6 +62,63 @@ def health():
     return {"ok": True}
 
 
+@app.get("/api/news")
+def get_market_issue_news():
+    """
+    특정 종목 뉴스가 아니라, 현재 시장에서 이슈가 되는 증권/경제/섹터 뉴스를 수집합니다.
+    Yahoo Finance Search API의 newsCount 기능을 이용합니다.
+    """
+    queries = [
+        "stock market today",
+        "market movers",
+        "nasdaq stocks today",
+        "AI stocks semiconductor market",
+        "Federal Reserve interest rates stocks",
+        "oil prices inflation stocks",
+        "Korea stock market",
+        "global markets today",
+        "earnings stock market",
+        "ETF market trends"
+    ]
+
+    collected = []
+    seen_titles = set()
+
+    for query in queries:
+        for item in yahoo_market_news_search(query):
+            title = item.get("title", "").strip()
+            if not title:
+                continue
+
+            title_key = normalize_text(title)
+            if title_key in seen_titles:
+                continue
+
+            seen_titles.add(title_key)
+
+            collected.append({
+                "category": classify_market_news(title),
+                "symbol": item.get("related", "Market"),
+                "title": title,
+                "publisher": item.get("publisher", "Market News"),
+                "link": item.get("link", ""),
+                "date": item.get("date", ""),
+                "summary": make_news_summary(title),
+                "importance": score_market_news(title)
+            })
+
+    collected = sorted(collected, key=lambda x: x.get("importance", 0), reverse=True)
+
+    if not collected:
+        collected = fallback_market_news()
+
+    return {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "Yahoo Finance market issue search",
+        "items": collected[:18]
+    }
+
+
 @app.get("/api/search")
 def search_stock(q: str = Query("")):
     q = q.strip()
@@ -249,6 +306,128 @@ def get_module(module_id: str, period: str = "6mo"):
         return market_value(period)
 
     return {"error": "Unknown module"}
+
+
+def yahoo_market_news_search(query: str):
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/search"
+        params = {
+            "q": query,
+            "quotesCount": 0,
+            "newsCount": 8,
+            "enableFuzzyQuery": "true"
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        res = requests.get(url, params=params, headers=headers, timeout=8)
+        data = res.json()
+
+        results = []
+
+        for item in data.get("news", []):
+            title = item.get("title", "") or ""
+            publisher = item.get("publisher", "") or ""
+            link = item.get("link", "") or ""
+            published = item.get("providerPublishTime", None)
+            related = item.get("relatedTickers", [])
+
+            date_text = ""
+            if published:
+                try:
+                    date_text = datetime.fromtimestamp(published).strftime("%Y-%m-%d")
+                except Exception:
+                    date_text = ""
+
+            results.append({
+                "title": title,
+                "publisher": publisher,
+                "link": link,
+                "date": date_text,
+                "related": ", ".join(related[:3]) if isinstance(related, list) else "Market"
+            })
+
+        return results
+
+    except Exception:
+        return []
+
+
+def classify_market_news(title: str):
+    t = title.lower()
+
+    if any(w in t for w in ["fed", "rate", "inflation", "yield", "treasury"]):
+        return "금리·인플레이션"
+    if any(w in t for w in ["ai", "nvidia", "semiconductor", "chip", "tech"]):
+        return "AI·반도체"
+    if any(w in t for w in ["oil", "energy", "crude", "wti", "gas"]):
+        return "에너지·원자재"
+    if any(w in t for w in ["earnings", "profit", "revenue", "guidance"]):
+        return "실적"
+    if any(w in t for w in ["nasdaq", "s&p", "dow", "stock market", "market"]):
+        return "시장 전체"
+    if any(w in t for w in ["korea", "kospi", "won", "samsung"]):
+        return "한국시장"
+
+    return "시장 이슈"
+
+
+def score_market_news(title: str):
+    t = title.lower()
+
+    score = 0
+
+    high_keywords = [
+        "fed", "inflation", "rate", "nasdaq", "s&p", "ai", "nvidia",
+        "semiconductor", "earnings", "market", "oil", "bond", "yield",
+        "tariff", "china", "recession", "rally", "selloff"
+    ]
+
+    medium_keywords = [
+        "stocks", "etf", "dollar", "gold", "korea", "kospi",
+        "growth", "profit", "revenue", "forecast"
+    ]
+
+    for word in high_keywords:
+        if word in t:
+            score += 3
+
+    for word in medium_keywords:
+        if word in t:
+            score += 1
+
+    return score
+
+
+def make_news_summary(title: str):
+    category = classify_market_news(title)
+
+    if category == "금리·인플레이션":
+        return "금리, 물가, 채권금리 변화는 성장주와 위험자산 선호도에 직접적인 영향을 줄 수 있습니다."
+    if category == "AI·반도체":
+        return "AI와 반도체 관련 이슈는 기술주, 성장주, 관련 공급망 종목의 투자심리에 영향을 줄 수 있습니다."
+    if category == "에너지·원자재":
+        return "유가와 원자재 가격 변화는 인플레이션, 운송비, 산업재 수익성에 영향을 줄 수 있습니다."
+    if category == "실적":
+        return "기업 실적과 가이던스는 개별 종목뿐 아니라 해당 섹터의 밸류에이션에도 영향을 줄 수 있습니다."
+    if category == "한국시장":
+        return "한국시장 관련 이슈는 환율, 외국인 수급, 반도체·자동차·2차전지 섹터와 함께 확인할 필요가 있습니다."
+
+    return "시장 전반의 투자심리와 자금 흐름에 영향을 줄 수 있는 이슈입니다."
+
+
+def fallback_market_news():
+    return [
+        {
+            "category": "시장 이슈",
+            "symbol": "Market",
+            "title": "현재 시장 이슈 데이터를 일시적으로 불러오지 못했습니다.",
+            "publisher": "Alpharion AI",
+            "link": "",
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "summary": "잠시 후 다시 시도하면 시장 이슈 뉴스가 표시됩니다.",
+            "importance": 0
+        }
+    ]
 
 
 def market_overview(period):
