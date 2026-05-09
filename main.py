@@ -23,6 +23,357 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+import os
+import re
+import sqlite3
+import smtplib
+import secrets
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Optional
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from fastapi import HTTPException, Header, Depends
+
+AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "./alpharion_auth.db")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_THIS_SECRET_KEY_ON_RENDER")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "7"))
+VERIFY_TOKEN_EXPIRE_HOURS = int(os.getenv("VERIFY_TOKEN_EXPIRE_HOURS", "24"))
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "no-reply@alpharion.cloud")
+MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "Alpharion AI Market Watch")
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+class SignupRequest(BaseModel):
+    name: Optional[str] = ""
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class ResendVerifyRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+def get_auth_db():
+    conn = sqlite3.connect(AUTH_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_auth_db():
+    conn = get_auth_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_verified INTEGER DEFAULT 0,
+            verify_token TEXT,
+            verify_expires_at TEXT,
+            reset_token TEXT,
+            reset_expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str):
+    return pwd_context.verify(password, password_hash)
+
+
+def make_token():
+    return secrets.token_urlsafe(32)
+
+
+def utcnow():
+    return datetime.utcnow()
+
+
+def create_access_token(user_id: int, email: str):
+    expire = utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    payload = {"sub": str(user_id), "email": email, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def get_user_by_email(email: str):
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (email,)).fetchone()
+    conn.close()
+    return user
+
+
+def get_user_by_id(user_id: int):
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    return user
+
+
+def public_user(user):
+    if not user:
+        return None
+    return {
+        "id": user["id"],
+        "name": user["name"] or "",
+        "email": user["email"],
+        "is_verified": bool(user["is_verified"]),
+        "created_at": user["created_at"]
+    }
+
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print("[AUTH EMAIL DEV MODE] SMTP not configured. Email:", to_email, subject, text_body or html_body)
+        return False
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM}>"
+    msg["To"] = to_email
+    msg.attach(MIMEText(text_body or re.sub("<[^>]+>", "", html_body), "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        if SMTP_USE_TLS:
+            server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(MAIL_FROM, [to_email], msg.as_string())
+    return True
+
+
+def send_verification_email(email: str, token: str):
+    verify_url = f"{API_PUBLIC_BASE()}/api/auth/verify?token={token}"
+    html = f"""
+    <div style='font-family:Arial,sans-serif;line-height:1.7;color:#111827'>
+      <h2>Alpharion AI 이메일 인증</h2>
+      <p>아래 버튼을 클릭하면 이메일 인증이 완료됩니다.</p>
+      <p><a href='{verify_url}' style='display:inline-block;background:#22c55e;color:white;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:bold'>이메일 인증하기</a></p>
+      <p>버튼이 작동하지 않으면 아래 주소를 브라우저에 붙여넣어 주세요.</p>
+      <p>{verify_url}</p>
+    </div>
+    """
+    text = f"Alpharion AI 이메일 인증 링크: {verify_url}"
+    return send_email(email, "[Alpharion AI] 이메일 인증을 완료해주세요", html, text)
+
+
+def send_password_reset_email(email: str, token: str):
+    reset_url = f"{FRONTEND_BASE_URL}/?reset_token={token}"
+    html = f"""
+    <div style='font-family:Arial,sans-serif;line-height:1.7;color:#111827'>
+      <h2>Alpharion AI 비밀번호 재설정</h2>
+      <p>아래 링크로 접속해 새 비밀번호를 설정하세요.</p>
+      <p>{reset_url}</p>
+    </div>
+    """
+    text = f"Alpharion AI 비밀번호 재설정 링크: {reset_url}"
+    return send_email(email, "[Alpharion AI] 비밀번호 재설정", html, text)
+
+
+def API_PUBLIC_BASE():
+    return os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
+
+
+@app.on_event("startup")
+def on_startup_auth():
+    init_auth_db()
+
+
+@app.post("/api/auth/signup")
+def auth_signup(req: SignupRequest):
+    email = req.email.strip().lower()
+    name = (req.name or "").strip()
+    password = req.password
+
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="비밀번호는 최소 6자 이상이어야 합니다.")
+
+    existing = get_user_by_email(email)
+    if existing:
+        raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다.")
+
+    verify_token = make_token()
+    expires = utcnow() + timedelta(hours=VERIFY_TOKEN_EXPIRE_HOURS)
+    now = utcnow().isoformat()
+
+    conn = get_auth_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (name, email, password_hash, is_verified, verify_token, verify_expires_at, created_at, updated_at)
+        VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+    """, (name, email, hash_password(password), verify_token, expires.isoformat(), now, now))
+    conn.commit()
+    user_id = cur.lastrowid
+    conn.close()
+
+    email_sent = send_verification_email(email, verify_token)
+    return {
+        "ok": True,
+        "message": "회원가입이 완료되었습니다. 이메일 인증 링크를 확인해주세요.",
+        "email_sent": email_sent,
+        "user": {"id": user_id, "name": name, "email": email, "is_verified": False}
+    }
+
+
+@app.get("/api/auth/verify")
+def auth_verify(token: str):
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE verify_token=?", (token,)).fetchone()
+
+    if not user:
+        conn.close()
+        return {"ok": False, "message": "인증 링크가 올바르지 않습니다."}
+
+    exp = datetime.fromisoformat(user["verify_expires_at"])
+    if exp < utcnow():
+        conn.close()
+        return {"ok": False, "message": "인증 링크가 만료되었습니다. 인증메일을 다시 요청해주세요."}
+
+    conn.execute("""
+        UPDATE users SET is_verified=1, verify_token=NULL, verify_expires_at=NULL, updated_at=? WHERE id=?
+    """, (utcnow().isoformat(), user["id"]))
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "이메일 인증이 완료되었습니다. Alpharion AI 페이지로 돌아가 로그인해주세요.",
+        "login_url": FRONTEND_BASE_URL
+    }
+
+
+@app.post("/api/auth/resend-verification")
+def auth_resend(req: ResendVerifyRequest):
+    email = req.email.strip().lower()
+    user = get_user_by_email(email)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="가입되지 않은 이메일입니다.")
+
+    if user["is_verified"]:
+        return {"ok": True, "message": "이미 이메일 인증이 완료된 계정입니다."}
+
+    token = make_token()
+    expires = utcnow() + timedelta(hours=VERIFY_TOKEN_EXPIRE_HOURS)
+    conn = get_auth_db()
+    conn.execute("UPDATE users SET verify_token=?, verify_expires_at=?, updated_at=? WHERE id=?",
+                 (token, expires.isoformat(), utcnow().isoformat(), user["id"]))
+    conn.commit()
+    conn.close()
+
+    email_sent = send_verification_email(email, token)
+    return {"ok": True, "message": "인증메일을 다시 보냈습니다.", "email_sent": email_sent}
+
+
+@app.post("/api/auth/login")
+def auth_login(req: LoginRequest):
+    email = req.email.strip().lower()
+    user = get_user_by_email(email)
+
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
+
+    if not user["is_verified"]:
+        raise HTTPException(status_code=403, detail="이메일 인증이 필요합니다. 메일함에서 인증 링크를 확인해주세요.")
+
+    token = create_access_token(user["id"], user["email"])
+    return {"ok": True, "access_token": token, "token_type": "bearer", "user": public_user(user)}
+
+
+def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except (JWTError, ValueError):
+        raise HTTPException(status_code=401, detail="로그인 토큰이 올바르지 않습니다.")
+
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
+    return user
+
+
+@app.get("/api/auth/me")
+def auth_me(user = Depends(get_current_user)):
+    return {"ok": True, "user": public_user(user)}
+
+
+@app.post("/api/auth/request-password-reset")
+def auth_request_password_reset(req: PasswordResetRequest):
+    email = req.email.strip().lower()
+    user = get_user_by_email(email)
+    if not user:
+        return {"ok": True, "message": "가입된 이메일인 경우 비밀번호 재설정 메일을 보냅니다."}
+
+    token = make_token()
+    expires = utcnow() + timedelta(hours=2)
+    conn = get_auth_db()
+    conn.execute("UPDATE users SET reset_token=?, reset_expires_at=?, updated_at=? WHERE id=?",
+                 (token, expires.isoformat(), utcnow().isoformat(), user["id"]))
+    conn.commit()
+    conn.close()
+
+    send_password_reset_email(email, token)
+    return {"ok": True, "message": "가입된 이메일인 경우 비밀번호 재설정 메일을 보냅니다."}
+
+
+@app.post("/api/auth/reset-password")
+def auth_reset_password(req: PasswordResetConfirmRequest):
+    if len(req.new_password) < 6:
+        raise HTTPException(status_code=400, detail="새 비밀번호는 최소 6자 이상이어야 합니다.")
+
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE reset_token=?", (req.token,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=400, detail="비밀번호 재설정 링크가 올바르지 않습니다.")
+
+    exp = datetime.fromisoformat(user["reset_expires_at"])
+    if exp < utcnow():
+        conn.close()
+        raise HTTPException(status_code=400, detail="비밀번호 재설정 링크가 만료되었습니다.")
+
+    conn.execute("UPDATE users SET password_hash=?, reset_token=NULL, reset_expires_at=NULL, updated_at=? WHERE id=?",
+                 (hash_password(req.new_password), utcnow().isoformat(), user["id"]))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "비밀번호가 변경되었습니다. 다시 로그인해주세요."}
+
+
 KOREAN_NAME_MAP = {
     "삼성전자": "005930.KS",
     "SK하이닉스": "000660.KS",

@@ -1,7 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 yfinance
 numpy
 requests
-finance-datareader
-pandas
+FinanceDataReader
+pydantic[email]
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
