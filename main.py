@@ -1,10 +1,24 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Optional
+
+import math
+import os
+import re
+import secrets
+import smtplib
+import sqlite3
+
 import numpy as np
 import requests
-from datetime import datetime
-import math
+import yfinance as yf
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr
 
 try:
     import FinanceDataReader as fdr
@@ -13,47 +27,58 @@ except Exception:
     FDR_AVAILABLE = False
 
 
-app = FastAPI(title="Alpharion Market Watch API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-import os
-import re
-import sqlite3
-import smtplib
-import secrets
-from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from typing import Optional
-from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
-from jose import jwt, JWTError
-from fastapi import HTTPException, Header, Depends
-
-AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "./alpharion_auth.db")
+AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "/opt/render/project/src/alpharion_auth.db")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_THIS_SECRET_KEY_ON_RENDER")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "7"))
 VERIFY_TOKEN_EXPIRE_HOURS = int(os.getenv("VERIFY_TOKEN_EXPIRE_HOURS", "24"))
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud").rstrip("/")
+API_PUBLIC_BASE_URL = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com").rstrip("/")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
-MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER or "no-reply@alpharion.cloud")
+MAIL_FROM = os.getenv("MAIL_FROM", os.getenv("MAIL_FROM_EMAIL", SMTP_USER or "no-reply@alpharion.cloud"))
 MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "Alpharion AI Market Watch")
 
+ALLOWED_ORIGINS = [
+    FRONTEND_BASE_URL,
+    "https://www.alpharion.cloud",
+    "https://alpharion.cloud",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+ALLOWED_ORIGINS = list(dict.fromkeys([origin for origin in ALLOWED_ORIGINS if origin]))
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def validate_runtime_config():
+    is_render = os.getenv("RENDER", "").lower() == "true"
+    if is_render and JWT_SECRET_KEY == "CHANGE_THIS_SECRET_KEY_ON_RENDER":
+        raise RuntimeError("JWT_SECRET_KEY not configured. Set JWT_SECRET_KEY in Render Environment Variables.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_runtime_config()
+    init_auth_db()
+    yield
+
+
+app = FastAPI(title="Alpharion Market Watch API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class SignupRequest(BaseModel):
     name: Optional[str] = ""
@@ -156,23 +181,27 @@ def send_email(to_email: str, subject: str, html_body: str, text_body: str = "")
         print("[AUTH EMAIL DEV MODE] SMTP not configured. Email:", to_email, subject, text_body or html_body)
         return False
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM}>"
-    msg["To"] = to_email
-    msg.attach(MIMEText(text_body or re.sub("<[^>]+>", "", html_body), "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM}>"
+        msg["To"] = to_email
+        msg.attach(MIMEText(text_body or re.sub("<[^>]+>", "", html_body), "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        if SMTP_USE_TLS:
-            server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(MAIL_FROM, [to_email], msg.as_string())
-    return True
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            if SMTP_USE_TLS:
+                server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(MAIL_FROM, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print("[SMTP ERROR]", repr(e))
+        return False
 
 
 def send_verification_email(email: str, token: str):
-    verify_url = f"{API_PUBLIC_BASE()}/api/auth/verify?token={token}"
+    verify_url = f"{FRONTEND_BASE_URL}/verify.html?token={token}"
     html = f"""
     <div style='font-family:Arial,sans-serif;line-height:1.7;color:#111827'>
       <h2>Alpharion AI 이메일 인증</h2>
@@ -200,12 +229,8 @@ def send_password_reset_email(email: str, token: str):
 
 
 def API_PUBLIC_BASE():
-    return os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
+    return API_PUBLIC_BASE_URL
 
-
-@app.on_event("startup")
-def on_startup_auth():
-    init_auth_db()
 
 
 @app.post("/api/auth/signup")

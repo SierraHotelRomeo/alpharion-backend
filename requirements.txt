@@ -3,7 +3,7 @@ uvicorn[standard]
 yfinance
 numpy
 requests
-FinanceDataReader
+finance-datareader
 pydantic[email]
 passlib[bcrypt]
 python-jose[cryptography]
