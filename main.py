@@ -230,9 +230,9 @@ app.add_middleware(
 )
 
 
-# =========================================================
+# ======================================================
 # Auth Helpers
-# =========================================================
+# ======================================================
 def hash_secret(value: str):
     return pwd_context.hash(value)
 
@@ -262,7 +262,7 @@ def make_email_verification_code():
 
 def send_mail(to_email: str, subject: str, body: str):
     if not BREVO_API_KEY:
-        raise HTTPException(status_code=500, detail="Brevo API Key가 설정되지 않았습니다. Render 환경변수 BREVO_API_KEY를 확인해주세요.")
+        raise HTTPException(status_code=500, detail="Brevo API Key가 설정되지 않았습니다. Render 환경변수 BREVO_API_KEY를 확인.")
     if not BREVO_FROM_EMAIL:
         raise HTTPException(status_code=500, detail="Brevo 발신 이메일이 설정되지 않았습니다.")
 
