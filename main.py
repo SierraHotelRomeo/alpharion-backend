@@ -40,6 +40,13 @@ FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
 API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
 
 # =========================================================
+# Admin Settings
+# =========================================================
+# Render Environment Variables에 ADMIN_SECRET_KEY를 추가하세요.
+# admin.html에서 입력한 관리자 키와 이 값이 일치해야 회원 목록을 볼 수 있습니다.
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "")
+
+# =========================================================
 # Brevo Transactional Email API Settings
 # =========================================================
 # BREVO_API_KEY는 코드에 직접 넣지 않고 Render Environment Variables에서 불러옵니다.
@@ -529,6 +536,25 @@ def get_current_user(authorization: Optional[str] = Header(None)):
     return user
 
 
+
+
+def verify_admin_secret(x_admin_secret: Optional[str] = Header(None)):
+    if not ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_SECRET_KEY가 Render 환경변수에 설정되지 않았습니다.")
+    if not x_admin_secret or not hmac.compare_digest(str(x_admin_secret), str(ADMIN_SECRET_KEY)):
+        raise HTTPException(status_code=401, detail="관리자 인증이 필요합니다.")
+    return True
+
+
+def admin_public_user(row):
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "terms_accepted": bool(row["terms_accepted"]),
+    }
+
 @app.get("/api/auth/me")
 def auth_me(user=Depends(get_current_user)):
     return {"ok": True, "user": public_user(user)}
@@ -642,6 +668,82 @@ def auth_reset_password(req: PasswordResetConfirmRequest):
     conn.close()
 
     return {"ok": True, "message": "비밀번호가 변경되었습니다. 새 비밀번호로 로그인해주세요."}
+
+
+
+
+# =========================================================
+# Admin API
+# =========================================================
+@app.get("/api/admin/users/count")
+def admin_users_count(admin_ok=Depends(verify_admin_secret)):
+    conn = get_auth_db()
+    total = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+    conn.close()
+    return {"ok": True, "count": int(total)}
+
+
+@app.get("/api/admin/users")
+def admin_users(
+    q: str = Query(""),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    admin_ok=Depends(verify_admin_secret),
+):
+    q = (q or "").strip().lower()
+    conn = get_auth_db()
+
+    if q:
+        like = f"%{q}%"
+        total = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM users WHERE lower(email) LIKE ?",
+            (like,),
+        ).fetchone()["cnt"]
+        rows = conn.execute(
+            """
+            SELECT id, email, terms_accepted, created_at, updated_at
+            FROM users
+            WHERE lower(email) LIKE ?
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (like, limit, offset),
+        ).fetchall()
+    else:
+        total = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
+        rows = conn.execute(
+            """
+            SELECT id, email, terms_accepted, created_at, updated_at
+            FROM users
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        ).fetchall()
+
+    conn.close()
+    return {
+        "ok": True,
+        "count": int(total),
+        "limit": int(limit),
+        "offset": int(offset),
+        "users": [admin_public_user(row) for row in rows],
+    }
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: int, admin_ok=Depends(verify_admin_secret)):
+    conn = get_auth_db()
+    user = conn.execute("SELECT id, email FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="해당 회원을 찾을 수 없습니다.")
+
+    conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "회원 계정이 삭제되었습니다.", "deleted_user_id": user_id, "deleted_email": user["email"]}
 
 
 # =========================================================
