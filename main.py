@@ -6,6 +6,7 @@ import base64
 import json
 import secrets
 import sqlite3
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -29,7 +30,14 @@ except Exception:
 # =========================================================
 # Auth / Runtime Settings
 # =========================================================
-AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "/opt/render/project/src/alpharion_auth.db")
+# 회원정보 DB 저장 경로
+# Render Persistent Disk를 사용하는 경우 Environment Variable에 아래처럼 설정하세요.
+# AUTH_DB_PATH=/var/data/alpharion_auth.db
+#
+# 기존에 /opt/render/project/src/alpharion_auth.db에 있던 DB가 있고,
+# /var/data/alpharion_auth.db가 아직 없으면 서버 시작 시 자동으로 1회 복사합니다.
+AUTH_DB_PATH = os.getenv("AUTH_DB_PATH") or os.getenv("DB_PATH") or "/var/data/alpharion_auth.db"
+LEGACY_AUTH_DB_PATH = "/opt/render/project/src/alpharion_auth.db"
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_THIS_SECRET_KEY_ON_RENDER")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "7"))
@@ -120,6 +128,37 @@ def get_auth_db():
     return conn
 
 
+def migrate_legacy_auth_db_if_needed():
+    """
+    Render 재배포 후에도 회원정보가 유지되도록 Persistent Disk 경로를 사용합니다.
+    기존 임시 경로 DB가 있고 새 Persistent Disk DB가 아직 없으면 최초 1회 자동 복사합니다.
+    이미 /var/data/alpharion_auth.db가 있으면 절대 덮어쓰지 않습니다.
+    """
+    target_path = os.path.abspath(AUTH_DB_PATH)
+    legacy_path = os.path.abspath(LEGACY_AUTH_DB_PATH)
+
+    if target_path == legacy_path:
+        return
+
+    if os.path.exists(target_path):
+        return
+
+    if not os.path.exists(legacy_path):
+        return
+
+    target_dir = os.path.dirname(target_path)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    try:
+        shutil.copy2(legacy_path, target_path)
+        print(f"AUTH DB migrated from {legacy_path} to {target_path}")
+    except Exception as e:
+        print("AUTH DB MIGRATION ERROR:", repr(e))
+
+
+
+
 def ensure_column(conn, table_name: str, column_name: str, column_sql: str):
     cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
     existing = {col["name"] for col in cols}
@@ -169,7 +208,9 @@ def init_auth_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_runtime_config()
+    migrate_legacy_auth_db_if_needed()
     init_auth_db()
+    print(f"AUTH_DB_PATH={AUTH_DB_PATH}")
     yield
 
 
