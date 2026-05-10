@@ -1,13 +1,13 @@
 import os
 import re
 import math
+import hmac
+import base64
+import json
 import secrets
 import sqlite3
-import smtplib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Optional
 
 import numpy as np
@@ -33,26 +33,23 @@ AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "/opt/render/project/src/alpharion_auth
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "CHANGE_THIS_SECRET_KEY_ON_RENDER")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = int(os.getenv("ACCESS_TOKEN_EXPIRE_DAYS", "7"))
-VERIFY_TOKEN_EXPIRE_HOURS = int(os.getenv("VERIFY_TOKEN_EXPIRE_HOURS", "24"))
+CAPTCHA_EXPIRE_MINUTES = int(os.getenv("CAPTCHA_EXPIRE_MINUTES", "10"))
+
+# Render 배포 주소와 Netlify 프론트 주소를 본인 환경에 맞게 설정하세요.
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
 API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
-
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
-MAIL_FROM_EMAIL = os.getenv("MAIL_FROM_EMAIL", os.getenv("MAIL_FROM", SMTP_USER or "no-reply@alpharion.cloud"))
-MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "Alpharion AI Market Watch")
 
 # bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 
 class SignupRequest(BaseModel):
-    name: Optional[str] = ""
     email: EmailStr
     password: str
+    password_confirm: str
+    captcha_token: str
+    captcha_answer: str
+    terms_accepted: bool
 
 
 class LoginRequest(BaseModel):
@@ -60,17 +57,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class ResendVerifyRequest(BaseModel):
-    email: EmailStr
-
-
-class PasswordResetRequest(BaseModel):
-    email: EmailStr
-
-
 class PasswordResetConfirmRequest(BaseModel):
-    token: str
+    email: EmailStr
+    recovery_code: str
     new_password: str
+    new_password_confirm: str
+    captcha_token: str
+    captcha_answer: str
 
 
 def validate_runtime_config():
@@ -91,6 +84,13 @@ def get_auth_db():
     return conn
 
 
+def ensure_column(conn, table_name: str, column_name: str, column_sql: str):
+    cols = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = {col["name"] for col in cols}
+    if column_name not in existing:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+
+
 def init_auth_db():
     conn = get_auth_db()
     cur = conn.cursor()
@@ -98,19 +98,19 @@ def init_auth_db():
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            is_verified INTEGER DEFAULT 0,
-            verify_token TEXT,
-            verify_expires_at TEXT,
-            reset_token TEXT,
-            reset_expires_at TEXT,
+            recovery_code_hash TEXT,
+            terms_accepted INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
         """
     )
+
+    # 기존 서버 DB를 그대로 쓰는 경우를 위한 안전 마이그레이션
+    ensure_column(conn, "users", "recovery_code_hash", "recovery_code_hash TEXT")
+    ensure_column(conn, "users", "terms_accepted", "terms_accepted INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -141,22 +141,26 @@ app.add_middleware(
 # =========================================================
 # Auth Helpers
 # =========================================================
-def hash_password(password: str):
-    return pwd_context.hash(password)
+def hash_secret(value: str):
+    return pwd_context.hash(value)
 
 
-def verify_password(password: str, password_hash: str):
-    return pwd_context.verify(password, password_hash)
-
-
-def make_token():
-    return secrets.token_urlsafe(32)
+def verify_secret(value: str, hashed_value: str):
+    if not hashed_value:
+        return False
+    return pwd_context.verify(value, hashed_value)
 
 
 def create_access_token(user_id: int, email: str):
     expire = utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
     payload = {"sub": str(user_id), "email": email, "exp": expire}
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def make_recovery_code():
+    # 예: AMW-A1B2-C3D4-E5F6
+    raw = secrets.token_hex(6).upper()
+    return f"AMW-{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
 
 
 def get_user_by_email(email: str):
@@ -178,162 +182,136 @@ def public_user(user):
         return None
     return {
         "id": user["id"],
-        "name": user["name"] or "",
         "email": user["email"],
-        "is_verified": bool(user["is_verified"]),
         "created_at": user["created_at"],
     }
 
 
-def send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        print("[AUTH EMAIL DEV MODE] SMTP not configured.")
-        print("TO:", to_email)
-        print("SUBJECT:", subject)
-        print("BODY:", text_body or re.sub("<[^>]+>", "", html_body))
-        return False
+def make_captcha_question():
+    ops = ["+", "-", "×"]
+    op = secrets.choice(ops)
 
+    if op == "+":
+        a = secrets.randbelow(18) + 2
+        b = secrets.randbelow(18) + 2
+        answer = a + b
+    elif op == "-":
+        a = secrets.randbelow(25) + 10
+        b = secrets.randbelow(9) + 1
+        answer = a - b
+    else:
+        a = secrets.randbelow(8) + 2
+        b = secrets.randbelow(8) + 2
+        answer = a * b
+
+    return f"{a} {op} {b} = ?", str(answer)
+
+
+def b64url_encode(data: bytes):
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def b64url_decode(data: str):
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode((data + padding).encode("utf-8"))
+
+
+def sign_payload(payload: dict):
+    body = b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    sig = hmac.new(JWT_SECRET_KEY.encode("utf-8"), body.encode("utf-8"), "sha256").digest()
+    return f"{body}.{b64url_encode(sig)}"
+
+
+def verify_signed_payload(token: str):
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>"
-        msg["To"] = to_email
-        msg.attach(MIMEText(text_body or re.sub("<[^>]+>", "", html_body), "plain", "utf-8"))
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-        if SMTP_USE_TLS:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
-        else:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(MAIL_FROM_EMAIL, [to_email], msg.as_string())
-        return True
-    except Exception as e:
-        print("[SMTP ERROR]", repr(e))
-        return False
+        body, sig = token.split(".", 1)
+        expected = hmac.new(JWT_SECRET_KEY.encode("utf-8"), body.encode("utf-8"), "sha256").digest()
+        actual = b64url_decode(sig)
+        if not hmac.compare_digest(expected, actual):
+            raise ValueError("bad signature")
+        payload = json.loads(b64url_decode(body).decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(utcnow().timestamp()):
+            raise ValueError("expired")
+        return payload
+    except Exception:
+        raise HTTPException(status_code=400, detail="보안질문이 만료되었습니다. 새로고침 후 다시 시도해주세요.")
 
 
-def send_verification_email(email: str, token: str):
-    verify_url = f"{API_PUBLIC_BASE}/api/auth/verify?token={token}"
-    html = f"""
-    <div style="font-family:Arial,sans-serif;line-height:1.7;color:#111827">
-      <h2>Alpharion AI 이메일 인증</h2>
-      <p>아래 버튼을 클릭하면 이메일 인증이 완료됩니다.</p>
-      <p><a href="{verify_url}" style="display:inline-block;background:#22c55e;color:white;padding:12px 18px;border-radius:10px;text-decoration:none;font-weight:bold">이메일 인증하기</a></p>
-      <p>버튼이 작동하지 않으면 아래 주소를 브라우저에 붙여넣어 주세요.</p>
-      <p>{verify_url}</p>
-    </div>
-    """
-    text = f"Alpharion AI 이메일 인증 링크: {verify_url}"
-    return send_email(email, "[Alpharion AI] 이메일 인증을 완료해주세요", html, text)
+def verify_captcha(token: str, answer: str, purpose: str):
+    payload = verify_signed_payload(token)
+    if payload.get("purpose") != purpose:
+        raise HTTPException(status_code=400, detail="보안질문이 올바르지 않습니다.")
+    if str(payload.get("answer", "")).strip() != str(answer).strip():
+        raise HTTPException(status_code=400, detail="보안질문 정답이 올바르지 않습니다.")
 
 
-def send_password_reset_email(email: str, token: str):
-    reset_url = f"{FRONTEND_BASE_URL}/?reset_token={token}"
-    html = f"""
-    <div style="font-family:Arial,sans-serif;line-height:1.7;color:#111827">
-      <h2>Alpharion AI 비밀번호 재설정</h2>
-      <p>아래 링크로 접속해 새 비밀번호를 설정하세요.</p>
-      <p>{reset_url}</p>
-    </div>
-    """
-    text = f"Alpharion AI 비밀번호 재설정 링크: {reset_url}"
-    return send_email(email, "[Alpharion AI] 비밀번호 재설정", html, text)
+def validate_password_pair(password: str, password_confirm: str, field_name: str = "비밀번호"):
+    if password != password_confirm:
+        raise HTTPException(status_code=400, detail=f"{field_name}와 재확인이 일치하지 않습니다.")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail=f"{field_name}는 최소 6자 이상이어야 합니다.")
+    if len(password.encode("utf-8")) > 512:
+        raise HTTPException(status_code=400, detail=f"{field_name}가 너무 깁니다. 512바이트 이하로 입력해주세요.")
 
 
 # =========================================================
 # Auth API
 # =========================================================
+@app.get("/api/auth/captcha")
+def auth_captcha(purpose: str = Query("signup")):
+    purpose = purpose if purpose in {"signup", "reset"} else "signup"
+    question, answer = make_captcha_question()
+    payload = {
+        "purpose": purpose,
+        "answer": answer,
+        "exp": int((utcnow() + timedelta(minutes=CAPTCHA_EXPIRE_MINUTES)).timestamp()),
+        "nonce": secrets.token_urlsafe(8),
+    }
+    return {"ok": True, "question": question, "token": sign_payload(payload)}
+
+
 @app.post("/api/auth/signup")
 def auth_signup(req: SignupRequest):
     email = req.email.strip().lower()
-    name = (req.name or "").strip()
     password = req.password or ""
 
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="비밀번호는 최소 6자 이상이어야 합니다.")
-    if len(password.encode("utf-8")) > 512:
-        raise HTTPException(status_code=400, detail="비밀번호가 너무 깁니다. 512바이트 이하로 입력해주세요.")
+    if not req.terms_accepted:
+        raise HTTPException(status_code=400, detail="이용약관에 동의해야 회원가입할 수 있습니다.")
+
+    verify_captcha(req.captcha_token, req.captcha_answer, "signup")
+    validate_password_pair(password, req.password_confirm, "비밀번호")
 
     existing = get_user_by_email(email)
     if existing:
         raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다.")
 
-    verify_token = make_token()
-    expires = utcnow() + timedelta(hours=VERIFY_TOKEN_EXPIRE_HOURS)
+    recovery_code = make_recovery_code()
     now = utcnow().isoformat()
 
     conn = get_auth_db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO users (name, email, password_hash, is_verified, verify_token, verify_expires_at, created_at, updated_at)
-        VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+        INSERT INTO users (email, password_hash, recovery_code_hash, terms_accepted, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?)
         """,
-        (name, email, hash_password(password), verify_token, expires.isoformat(), now, now),
+        (email, hash_secret(password), hash_secret(recovery_code), now, now),
     )
     conn.commit()
     user_id = cur.lastrowid
+    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     conn.close()
 
-    email_sent = send_verification_email(email, verify_token)
+    access_token = create_access_token(user_id, email)
+
     return {
         "ok": True,
-        "message": "회원가입이 완료되었습니다. 이메일 인증 링크를 확인해주세요.",
-        "email_sent": email_sent,
-        "user": {"id": user_id, "name": name, "email": email, "is_verified": False},
+        "message": "회원가입이 완료되었습니다.",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": public_user(user),
+        "recovery_code": recovery_code,
     }
-
-
-@app.get("/api/auth/verify")
-def auth_verify(token: str):
-    conn = get_auth_db()
-    user = conn.execute("SELECT * FROM users WHERE verify_token=?", (token,)).fetchone()
-
-    if not user:
-        conn.close()
-        return {"ok": False, "message": "인증 링크가 올바르지 않습니다.", "login_url": FRONTEND_BASE_URL}
-
-    exp = datetime.fromisoformat(user["verify_expires_at"])
-    if exp < utcnow():
-        conn.close()
-        return {"ok": False, "message": "인증 링크가 만료되었습니다. 인증메일을 다시 요청해주세요.", "login_url": FRONTEND_BASE_URL}
-
-    conn.execute(
-        "UPDATE users SET is_verified=1, verify_token=NULL, verify_expires_at=NULL, updated_at=? WHERE id=?",
-        (utcnow().isoformat(), user["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    return {"ok": True, "message": "이메일 인증이 완료되었습니다. Alpharion AI 페이지로 돌아가 로그인해주세요.", "login_url": FRONTEND_BASE_URL}
-
-
-@app.post("/api/auth/resend-verification")
-def auth_resend(req: ResendVerifyRequest):
-    email = req.email.strip().lower()
-    user = get_user_by_email(email)
-
-    if not user:
-        raise HTTPException(status_code=404, detail="가입되지 않은 이메일입니다.")
-    if user["is_verified"]:
-        return {"ok": True, "message": "이미 이메일 인증이 완료된 계정입니다."}
-
-    token = make_token()
-    expires = utcnow() + timedelta(hours=VERIFY_TOKEN_EXPIRE_HOURS)
-    conn = get_auth_db()
-    conn.execute(
-        "UPDATE users SET verify_token=?, verify_expires_at=?, updated_at=? WHERE id=?",
-        (token, expires.isoformat(), utcnow().isoformat(), user["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    email_sent = send_verification_email(email, token)
-    return {"ok": True, "message": "인증메일을 다시 보냈습니다.", "email_sent": email_sent}
 
 
 @app.post("/api/auth/login")
@@ -341,10 +319,8 @@ def auth_login(req: LoginRequest):
     email = req.email.strip().lower()
     user = get_user_by_email(email)
 
-    if not user or not verify_password(req.password, user["password_hash"]):
+    if not user or not verify_secret(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
-    if not user["is_verified"]:
-        raise HTTPException(status_code=403, detail="이메일 인증이 필요합니다. 메일함에서 인증 링크를 확인해주세요.")
 
     token = create_access_token(user["id"], user["email"])
     return {"ok": True, "access_token": token, "token_type": "bearer", "user": public_user(user)}
@@ -372,53 +348,32 @@ def auth_me(user=Depends(get_current_user)):
     return {"ok": True, "user": public_user(user)}
 
 
-@app.post("/api/auth/request-password-reset")
-def auth_request_password_reset(req: PasswordResetRequest):
-    email = req.email.strip().lower()
-    user = get_user_by_email(email)
-    if not user:
-        return {"ok": True, "message": "가입된 이메일인 경우 비밀번호 재설정 메일을 보냅니다."}
-
-    token = make_token()
-    expires = utcnow() + timedelta(hours=2)
-    conn = get_auth_db()
-    conn.execute(
-        "UPDATE users SET reset_token=?, reset_expires_at=?, updated_at=? WHERE id=?",
-        (token, expires.isoformat(), utcnow().isoformat(), user["id"]),
-    )
-    conn.commit()
-    conn.close()
-
-    send_password_reset_email(email, token)
-    return {"ok": True, "message": "가입된 이메일인 경우 비밀번호 재설정 메일을 보냅니다."}
-
-
 @app.post("/api/auth/reset-password")
 def auth_reset_password(req: PasswordResetConfirmRequest):
-    if len(req.new_password) < 6:
-        raise HTTPException(status_code=400, detail="새 비밀번호는 최소 6자 이상이어야 합니다.")
-    if len(req.new_password.encode("utf-8")) > 512:
-        raise HTTPException(status_code=400, detail="새 비밀번호가 너무 깁니다. 512바이트 이하로 입력해주세요.")
+    email = req.email.strip().lower()
+    verify_captcha(req.captcha_token, req.captcha_answer, "reset")
+    validate_password_pair(req.new_password, req.new_password_confirm, "새 비밀번호")
 
-    conn = get_auth_db()
-    user = conn.execute("SELECT * FROM users WHERE reset_token=?", (req.token,)).fetchone()
+    user = get_user_by_email(email)
     if not user:
-        conn.close()
-        raise HTTPException(status_code=400, detail="비밀번호 재설정 링크가 올바르지 않습니다.")
+        # 계정 존재 여부를 과도하게 노출하지 않기 위해 일반 메시지로 처리
+        raise HTTPException(status_code=400, detail="이메일 또는 복구코드가 올바르지 않습니다.")
 
-    exp = datetime.fromisoformat(user["reset_expires_at"])
-    if exp < utcnow():
-        conn.close()
-        raise HTTPException(status_code=400, detail="비밀번호 재설정 링크가 만료되었습니다.")
+    if not verify_secret(req.recovery_code.strip(), user["recovery_code_hash"]):
+        raise HTTPException(status_code=400, detail="이메일 또는 복구코드가 올바르지 않습니다.")
 
+    # 재설정 후 복구코드도 새로 발급하는 것이 더 안전하지만,
+    # 이메일 발송이 없으므로 사용자가 새 코드를 받지 못합니다.
+    # 따라서 현재 복구코드는 유지하고 비밀번호만 변경합니다.
+    conn = get_auth_db()
     conn.execute(
-        "UPDATE users SET password_hash=?, reset_token=NULL, reset_expires_at=NULL, updated_at=? WHERE id=?",
-        (hash_password(req.new_password), utcnow().isoformat(), user["id"]),
+        "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+        (hash_secret(req.new_password), utcnow().isoformat(), user["id"]),
     )
     conn.commit()
     conn.close()
 
-    return {"ok": True, "message": "비밀번호가 변경되었습니다. 다시 로그인해주세요."}
+    return {"ok": True, "message": "비밀번호가 변경되었습니다. 새 비밀번호로 로그인해주세요."}
 
 
 # =========================================================
