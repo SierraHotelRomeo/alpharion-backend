@@ -41,14 +41,14 @@ CAPTCHA_EXPIRE_MINUTES = int(os.getenv("CAPTCHA_EXPIRE_MINUTES", "10"))
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
 API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
 
-# SMTP / Mail Settings (NAVER WORKS 465 SSL 지원)
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.worksmobile.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER", os.getenv("MAIL_FROM_EMAIL", ""))
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", os.getenv("SMTP_PASS", ""))
-SMTP_FROM = os.getenv("SMTP_FROM", os.getenv("MAIL_FROM_EMAIL", SMTP_USER))
-SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", os.getenv("MAIL_FROM_NAME", "Alpharion AI"))
-PASSWORD_FIND_CODE_EXPIRE_MINUTES = int(os.getenv("PASSWORD_FIND_CODE_EXPIRE_MINUTES", "10"))
+# SMTP / Mail Settings - NAVER SMTP 직접 설정
+SMTP_HOST = "smtp.naver.com"
+SMTP_PORT = 465
+SMTP_USER = "codegeneva@naver.com"
+SMTP_PASSWORD = "N32W6NW32SX7"
+SMTP_FROM = "codegeneva@naver.com"
+SMTP_FROM_NAME = "Alpharion AI Market Watch"
+PASSWORD_FIND_CODE_EXPIRE_MINUTES = 10
 
 # bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
