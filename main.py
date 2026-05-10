@@ -6,8 +6,6 @@ import base64
 import json
 import secrets
 import sqlite3
-import smtplib
-from email.mime.text import MIMEText
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -44,19 +42,12 @@ API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrend
 # =========================================================
 # Brevo Transactional Email API Settings
 # =========================================================
-# Brevo: Settings > SMTP & API > API keys에서 v3 API Key를 생성한 뒤 아래에 입력하세요.
-# 보안을 위해 운영에서는 Render Environment Variable 사용을 권장하지만,
-# 요청에 따라 코드 내부에 직접 입력하는 방식으로 구성했습니다.
-# =========================================================
-# Brevo Transactional Email API Settings
-# =========================================================
+# BREVO_API_KEY는 코드에 직접 넣지 않고 Render Environment Variables에서 불러옵니다.
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
-
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
-
-BREVO_FROM_EMAIL = "codegeneva@naver.com"
-BREVO_FROM_NAME = "Alpharion AI Market Watch"
-PASSWORD_FIND_CODE_EXPIRE_MINUTES = 10
+BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "info@codegeneva.com")
+BREVO_FROM_NAME = os.getenv("BREVO_FROM_NAME", "Alpharion AI Market Watch")
+PASSWORD_FIND_CODE_EXPIRE_MINUTES = int(os.getenv("PASSWORD_FIND_CODE_EXPIRE_MINUTES", "10"))
 
 # bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
@@ -202,8 +193,10 @@ def make_email_verification_code():
 
 
 def send_mail(to_email: str, subject: str, body: str):
-    if not BREVO_API_KEY or BREVO_API_KEY == "여기에_BREVO_API_KEY_입력":
-        raise HTTPException(status_code=500, detail="Brevo API Key가 설정되지 않았습니다.")
+    if not BREVO_API_KEY:
+        raise HTTPException(status_code=500, detail="Brevo API Key가 설정되지 않았습니다. Render 환경변수 BREVO_API_KEY를 확인해주세요.")
+    if not BREVO_FROM_EMAIL:
+        raise HTTPException(status_code=500, detail="Brevo 발신 이메일이 설정되지 않았습니다.")
 
     payload = {
         "sender": {
