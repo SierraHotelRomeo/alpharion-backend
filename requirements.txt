@@ -5,7 +5,6 @@ numpy
 requests
 finance-datareader
 pydantic[email]
-passlib[bcrypt]
-bcrypt==4.0.1
+passlib
 python-jose[cryptography]
 python-multipart

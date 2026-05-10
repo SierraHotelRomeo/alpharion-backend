@@ -212,9 +212,10 @@ def send_mail(to_email: str, subject: str, body: str):
                 server.starttls()
                 server.login(SMTP_USER, SMTP_PASSWORD)
                 server.sendmail(SMTP_FROM, [to_email], msg.as_string())
-    except Exception:
-        raise HTTPException(status_code=500, detail="인증번호 이메일 발송에 실패했습니다. 메일 설정을 확인해주세요.")
 
+    except Exception as e:
+        print("SMTP ERROR:", repr(e))
+        raise HTTPException(status_code=500, detail=f"인증번호 이메일 발송 실패: {str(e)}")
 
 def send_password_find_email(to_email: str, code: str):
     subject = "Alpharion AI 비밀번호 찾기 인증번호"
