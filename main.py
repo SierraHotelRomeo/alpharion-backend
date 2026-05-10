@@ -41,13 +41,21 @@ CAPTCHA_EXPIRE_MINUTES = int(os.getenv("CAPTCHA_EXPIRE_MINUTES", "10"))
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
 API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
 
-# SMTP / Mail Settings - NAVER SMTP 직접 설정
-SMTP_HOST = "smtp.naver.com"
-SMTP_PORT = 465
-SMTP_USER = "codegeneva@naver.com"
-SMTP_PASSWORD = "N32W6NW32SX7"
-SMTP_FROM = "codegeneva@naver.com"
-SMTP_FROM_NAME = "Alpharion AI Market Watch"
+# =========================================================
+# Brevo Transactional Email API Settings
+# =========================================================
+# Brevo: Settings > SMTP & API > API keys에서 v3 API Key를 생성한 뒤 아래에 입력하세요.
+# 보안을 위해 운영에서는 Render Environment Variable 사용을 권장하지만,
+# 요청에 따라 코드 내부에 직접 입력하는 방식으로 구성했습니다.
+# =========================================================
+# Brevo Transactional Email API Settings
+# =========================================================
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
+
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+
+BREVO_FROM_EMAIL = "codegeneva@naver.com"
+BREVO_FROM_NAME = "Alpharion AI Market Watch"
 PASSWORD_FIND_CODE_EXPIRE_MINUTES = 10
 
 # bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
@@ -194,28 +202,40 @@ def make_email_verification_code():
 
 
 def send_mail(to_email: str, subject: str, body: str):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD or not SMTP_FROM:
-        raise HTTPException(status_code=500, detail="메일 발송 설정이 완료되지 않았습니다.")
+    if not BREVO_API_KEY or BREVO_API_KEY == "여기에_BREVO_API_KEY_입력":
+        raise HTTPException(status_code=500, detail="Brevo API Key가 설정되지 않았습니다.")
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>" if SMTP_FROM_NAME else SMTP_FROM
-    msg["To"] = to_email
+    payload = {
+        "sender": {
+            "name": BREVO_FROM_NAME,
+            "email": BREVO_FROM_EMAIL,
+        },
+        "to": [
+            {"email": to_email}
+        ],
+        "subject": subject,
+        "textContent": body,
+    }
+
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
 
     try:
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, [to_email], msg.as_string())
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_PASSWORD)
-                server.sendmail(SMTP_FROM, [to_email], msg.as_string())
-
+        res = requests.post(BREVO_API_URL, headers=headers, json=payload, timeout=20)
+        if res.status_code not in (200, 201, 202):
+            print("BREVO ERROR:", res.status_code, res.text)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Brevo 이메일 발송 실패: {res.status_code} / {res.text}",
+            )
+    except HTTPException:
+        raise
     except Exception as e:
-        print("SMTP ERROR:", repr(e))
-        raise HTTPException(status_code=500, detail=f"인증번호 이메일 발송 실패: {str(e)}")
+        print("BREVO REQUEST ERROR:", repr(e))
+        raise HTTPException(status_code=500, detail=f"Brevo 이메일 발송 요청 실패: {str(e)}")
 
 def send_password_find_email(to_email: str, code: str):
     subject = "Alpharion AI 비밀번호 찾기 인증번호"
