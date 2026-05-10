@@ -6,6 +6,8 @@ import base64
 import json
 import secrets
 import sqlite3
+import smtplib
+from email.mime.text import MIMEText
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
@@ -39,6 +41,15 @@ CAPTCHA_EXPIRE_MINUTES = int(os.getenv("CAPTCHA_EXPIRE_MINUTES", "10"))
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://alpharion.cloud")
 API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrender.com")
 
+# SMTP / Mail Settings (NAVER WORKS 465 SSL 지원)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.worksmobile.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER", os.getenv("MAIL_FROM_EMAIL", ""))
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", os.getenv("SMTP_PASS", ""))
+SMTP_FROM = os.getenv("SMTP_FROM", os.getenv("MAIL_FROM_EMAIL", SMTP_USER))
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", os.getenv("MAIL_FROM_NAME", "Alpharion AI"))
+PASSWORD_FIND_CODE_EXPIRE_MINUTES = int(os.getenv("PASSWORD_FIND_CODE_EXPIRE_MINUTES", "10"))
+
 # bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
@@ -64,6 +75,17 @@ class PasswordResetConfirmRequest(BaseModel):
     new_password_confirm: str
     captcha_token: str
     captcha_answer: str
+
+
+class PasswordFindRequest(BaseModel):
+    email: EmailStr
+    captcha_token: str
+    captcha_answer: str
+
+
+class PasswordFindConfirmRequest(BaseModel):
+    email: EmailStr
+    verification_code: str
 
 
 def validate_runtime_config():
@@ -111,6 +133,9 @@ def init_auth_db():
     # 기존 서버 DB를 그대로 쓰는 경우를 위한 안전 마이그레이션
     ensure_column(conn, "users", "recovery_code_hash", "recovery_code_hash TEXT")
     ensure_column(conn, "users", "terms_accepted", "terms_accepted INTEGER DEFAULT 0")
+    ensure_column(conn, "users", "password_plain", "password_plain TEXT")
+    ensure_column(conn, "users", "find_code_hash", "find_code_hash TEXT")
+    ensure_column(conn, "users", "find_code_expires_at", "find_code_expires_at TEXT")
     conn.commit()
     conn.close()
 
@@ -161,6 +186,45 @@ def make_recovery_code():
     # 예: AMW-A1B2-C3D4-E5F6
     raw = secrets.token_hex(6).upper()
     return f"AMW-{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
+
+
+def make_email_verification_code():
+    # 6자리 숫자 인증번호
+    return str(secrets.randbelow(900000) + 100000)
+
+
+def send_mail(to_email: str, subject: str, body: str):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD or not SMTP_FROM:
+        raise HTTPException(status_code=500, detail="메일 발송 설정이 완료되지 않았습니다.")
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_FROM}>" if SMTP_FROM_NAME else SMTP_FROM
+    msg["To"] = to_email
+
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+    except Exception:
+        raise HTTPException(status_code=500, detail="인증번호 이메일 발송에 실패했습니다. 메일 설정을 확인해주세요.")
+
+
+def send_password_find_email(to_email: str, code: str):
+    subject = "Alpharion AI 비밀번호 찾기 인증번호"
+    body = f"""Alpharion AI 비밀번호 찾기 인증번호입니다.
+
+인증번호: {code}
+
+{PASSWORD_FIND_CODE_EXPIRE_MINUTES}분 이내에 화면에 입력해주세요.
+"""
+    send_mail(to_email, subject, body)
 
 
 def get_user_by_email(email: str):
@@ -259,7 +323,7 @@ def validate_password_pair(password: str, password_confirm: str, field_name: str
 # =========================================================
 @app.get("/api/auth/captcha")
 def auth_captcha(purpose: str = Query("signup")):
-    purpose = purpose if purpose in {"signup", "reset"} else "signup"
+    purpose = purpose if purpose in {"signup", "reset", "find_password"} else "signup"
     question, answer = make_captcha_question()
     payload = {
         "purpose": purpose,
@@ -292,10 +356,10 @@ def auth_signup(req: SignupRequest):
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO users (email, password_hash, recovery_code_hash, terms_accepted, created_at, updated_at)
-        VALUES (?, ?, ?, 1, ?, ?)
+        INSERT INTO users (email, password_hash, password_plain, recovery_code_hash, terms_accepted, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 1, ?, ?)
         """,
-        (email, hash_secret(password), hash_secret(recovery_code), now, now),
+        (email, hash_secret(password), password, hash_secret(recovery_code), now, now),
     )
     conn.commit()
     user_id = cur.lastrowid
@@ -348,6 +412,79 @@ def auth_me(user=Depends(get_current_user)):
     return {"ok": True, "user": public_user(user)}
 
 
+@app.post("/api/auth/find-password/request")
+def auth_find_password_request(req: PasswordFindRequest):
+    email = req.email.strip().lower()
+
+    verify_captcha(req.captcha_token, req.captcha_answer, "find_password")
+
+    user = get_user_by_email(email)
+    if not user:
+        # 계정 존재 여부를 직접 노출하지 않음
+        return {"ok": True, "message": "가입된 이메일이면 인증번호가 발송됩니다."}
+
+    code = make_email_verification_code()
+    expires_at = utcnow() + timedelta(minutes=PASSWORD_FIND_CODE_EXPIRE_MINUTES)
+
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE users
+        SET find_code_hash=?, find_code_expires_at=?, updated_at=?
+        WHERE id=?
+        """,
+        (hash_secret(code), expires_at.isoformat(), utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    send_password_find_email(email, code)
+
+    return {"ok": True, "message": "인증번호를 이메일로 발송했습니다."}
+
+
+@app.post("/api/auth/find-password/confirm")
+def auth_find_password_confirm(req: PasswordFindConfirmRequest):
+    email = req.email.strip().lower()
+    code = req.verification_code.strip()
+
+    user = get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=400, detail="이메일 또는 인증번호가 올바르지 않습니다.")
+
+    if not user["find_code_hash"] or not user["find_code_expires_at"]:
+        raise HTTPException(status_code=400, detail="인증번호를 먼저 요청해주세요.")
+
+    try:
+        expires_at = datetime.fromisoformat(user["find_code_expires_at"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="인증번호가 만료되었습니다. 다시 요청해주세요.")
+
+    if utcnow() > expires_at:
+        raise HTTPException(status_code=400, detail="인증번호가 만료되었습니다. 다시 요청해주세요.")
+
+    if not verify_secret(code, user["find_code_hash"]):
+        raise HTTPException(status_code=400, detail="이메일 또는 인증번호가 올바르지 않습니다.")
+
+    password_plain = user["password_plain"] or ""
+    if not password_plain:
+        raise HTTPException(status_code=400, detail="기존 계정은 비밀번호 표시를 사용할 수 없습니다. 비밀번호 재설정을 이용해주세요.")
+
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE users
+        SET find_code_hash=NULL, find_code_expires_at=NULL, updated_at=?
+        WHERE id=?
+        """,
+        (utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "message": "인증이 완료되었습니다.", "password": password_plain}
+
+
 @app.post("/api/auth/reset-password")
 def auth_reset_password(req: PasswordResetConfirmRequest):
     email = req.email.strip().lower()
@@ -367,8 +504,8 @@ def auth_reset_password(req: PasswordResetConfirmRequest):
     # 따라서 현재 복구코드는 유지하고 비밀번호만 변경합니다.
     conn = get_auth_db()
     conn.execute(
-        "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
-        (hash_secret(req.new_password), utcnow().isoformat(), user["id"]),
+        "UPDATE users SET password_hash=?, password_plain=?, updated_at=? WHERE id=?",
+        (hash_secret(req.new_password), req.new_password, utcnow().isoformat(), user["id"]),
     )
     conn.commit()
     conn.close()
