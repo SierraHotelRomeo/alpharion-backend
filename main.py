@@ -45,7 +45,7 @@ API_PUBLIC_BASE = os.getenv("API_PUBLIC_BASE", "https://alpharion-backend.onrend
 # BREVO_API_KEY는 코드에 직접 넣지 않고 Render Environment Variables에서 불러옵니다.
 BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
-BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "info@codegeneva.com")
+BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "codegeneva@naver.com")
 BREVO_FROM_NAME = os.getenv("BREVO_FROM_NAME", "Alpharion AI Market Watch")
 PASSWORD_FIND_CODE_EXPIRE_MINUTES = int(os.getenv("PASSWORD_FIND_CODE_EXPIRE_MINUTES", "10"))
 
@@ -60,6 +60,14 @@ class SignupRequest(BaseModel):
     captcha_token: str
     captcha_answer: str
     terms_accepted: bool
+    signup_verification_code: str
+
+
+
+class SignupEmailCodeRequest(BaseModel):
+    email: EmailStr
+    captcha_token: str
+    captcha_answer: str
 
 
 class LoginRequest(BaseModel):
@@ -123,6 +131,18 @@ def init_auth_db():
             password_hash TEXT NOT NULL,
             recovery_code_hash TEXT,
             terms_accepted INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signup_email_verifications (
+            email TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -241,6 +261,53 @@ def send_password_find_email(to_email: str, code: str):
     send_mail(to_email, subject, body)
 
 
+def send_signup_verification_email(to_email: str, code: str):
+    subject = "Alpharion AI 회원가입 인증번호"
+    body = f"""Alpharion AI 회원가입 인증번호입니다.
+
+인증번호: {code}
+
+{PASSWORD_FIND_CODE_EXPIRE_MINUTES}분 이내에 회원가입 화면에 입력해주세요.
+"""
+    send_mail(to_email, subject, body)
+
+
+def get_signup_verification(email: str):
+    conn = get_auth_db()
+    row = conn.execute(
+        "SELECT * FROM signup_email_verifications WHERE lower(email)=lower(?)",
+        (email,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def clear_signup_verification(email: str):
+    conn = get_auth_db()
+    conn.execute("DELETE FROM signup_email_verifications WHERE lower(email)=lower(?)", (email,))
+    conn.commit()
+    conn.close()
+
+
+def verify_signup_email_code(email: str, code: str):
+    row = get_signup_verification(email)
+    if not row:
+        raise HTTPException(status_code=400, detail="회원가입 이메일 인증번호를 먼저 요청해주세요.")
+
+    try:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+    except Exception:
+        clear_signup_verification(email)
+        raise HTTPException(status_code=400, detail="회원가입 인증번호가 만료되었습니다. 다시 요청해주세요.")
+
+    if utcnow() > expires_at:
+        clear_signup_verification(email)
+        raise HTTPException(status_code=400, detail="회원가입 인증번호가 만료되었습니다. 다시 요청해주세요.")
+
+    if not verify_secret(code.strip(), row["code_hash"]):
+        raise HTTPException(status_code=400, detail="회원가입 인증번호가 올바르지 않습니다.")
+
+
 def get_user_by_email(email: str):
     conn = get_auth_db()
     user = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (email,)).fetchone()
@@ -348,6 +415,40 @@ def auth_captcha(purpose: str = Query("signup")):
     return {"ok": True, "question": question, "token": sign_payload(payload)}
 
 
+@app.post("/api/auth/signup/request-code")
+def auth_signup_request_code(req: SignupEmailCodeRequest):
+    email = req.email.strip().lower()
+
+    verify_captcha(req.captcha_token, req.captcha_answer, "signup")
+
+    existing = get_user_by_email(email)
+    if existing:
+        raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다.")
+
+    code = make_email_verification_code()
+    expires_at = utcnow() + timedelta(minutes=PASSWORD_FIND_CODE_EXPIRE_MINUTES)
+    now = utcnow().isoformat()
+
+    conn = get_auth_db()
+    conn.execute(
+        """
+        INSERT INTO signup_email_verifications (email, code_hash, expires_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(email) DO UPDATE SET
+            code_hash=excluded.code_hash,
+            expires_at=excluded.expires_at,
+            updated_at=excluded.updated_at
+        """,
+        (email, hash_secret(code), expires_at.isoformat(), now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    send_signup_verification_email(email, code)
+
+    return {"ok": True, "message": "회원가입 인증번호를 이메일로 발송했습니다."}
+
+
 @app.post("/api/auth/signup")
 def auth_signup(req: SignupRequest):
     email = req.email.strip().lower()
@@ -358,6 +459,11 @@ def auth_signup(req: SignupRequest):
 
     verify_captcha(req.captcha_token, req.captcha_answer, "signup")
     validate_password_pair(password, req.password_confirm, "비밀번호")
+
+    if not req.signup_verification_code.strip():
+        raise HTTPException(status_code=400, detail="회원가입 이메일 인증번호를 입력해주세요.")
+
+    verify_signup_email_code(email, req.signup_verification_code)
 
     existing = get_user_by_email(email)
     if existing:
@@ -379,6 +485,8 @@ def auth_signup(req: SignupRequest):
     user_id = cur.lastrowid
     user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     conn.close()
+
+    clear_signup_verification(email)
 
     access_token = create_access_token(user_id, email)
 
@@ -424,6 +532,15 @@ def get_current_user(authorization: Optional[str] = Header(None)):
 @app.get("/api/auth/me")
 def auth_me(user=Depends(get_current_user)):
     return {"ok": True, "user": public_user(user)}
+
+
+@app.delete("/api/auth/account")
+def auth_delete_account(user=Depends(get_current_user)):
+    conn = get_auth_db()
+    conn.execute("DELETE FROM users WHERE id=?", (user["id"],))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "message": "계정이 삭제되었습니다."}
 
 
 @app.post("/api/auth/find-password/request")
