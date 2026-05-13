@@ -69,9 +69,9 @@ PASSWORD_FIND_CODE_EXPIRE_MINUTES = int(os.getenv("PASSWORD_FIND_CODE_EXPIRE_MIN
 # Plan / NICEPAY Payment Settings
 # =========================================================
 FREE_AI_ANALYSIS_LIMIT = int(os.getenv("FREE_AI_ANALYSIS_LIMIT", "5"))
-STANDARD_PLAN_DAYS = int(os.getenv("STANDARD_PLAN_DAYS", "365"))
-STANDARD_PLAN_AMOUNT = int(os.getenv("STANDARD_PLAN_AMOUNT", "99000"))
-STANDARD_PLAN_NAME = os.getenv("STANDARD_PLAN_NAME", "Alpharion Standard 1년 이용권")
+STANDARD_PLAN_DAYS = int(os.getenv("STANDARD_PLAN_DAYS", "30"))
+STANDARD_PLAN_AMOUNT = int(os.getenv("STANDARD_PLAN_AMOUNT", "2000"))
+STANDARD_PLAN_NAME = os.getenv("STANDARD_PLAN_NAME", "Alpharion Standard 1개월 이용권")
 
 # NICEPAY 개발자센터에서 발급받은 값만 사용합니다.
 # NICEPAY_CLIENT_ID: 결제창 호출용 클라이언트키
@@ -933,9 +933,11 @@ def nicepay_sha256(text: str):
 
 
 def nicepay_basic_auth_header():
-    # NICEPAY Basic 인증은 시크릿키 뒤에 콜론(:)을 붙인 값을 base64 인코딩합니다.
-    # 예: Authorization: Basic base64(secretKey + ":")
-    raw = f"{NICEPAY_SECRET_KEY}:".encode("utf-8")
+    # NICEPAY Basic 인증 credentials 생성 규칙:
+    # Base64(client-key + ":" + secret-key)
+    # 시크릿키만 인코딩하면 NICEPAY 승인 API에서
+    # "사용자 정보가 존재하지 않습니다"류의 오류가 발생할 수 있습니다.
+    raw = f"{NICEPAY_CLIENT_ID}:{NICEPAY_SECRET_KEY}".encode("utf-8")
     return "Basic " + base64.b64encode(raw).decode("utf-8")
 
 
@@ -952,6 +954,41 @@ def get_payment_order(order_id: str):
     row = conn.execute("SELECT * FROM payment_orders WHERE order_id=?", (order_id,)).fetchone()
     conn.close()
     return row
+
+
+def update_payment_order(order_id: str, status: str, result_code: str = "", result_msg: str = "", raw_response=None, nicepay_tid: str = "", pay_method: str = ""):
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE payment_orders
+        SET status=?,
+            result_code=COALESCE(NULLIF(?, ''), result_code),
+            result_msg=COALESCE(NULLIF(?, ''), result_msg),
+            raw_response=COALESCE(?, raw_response),
+            nicepay_tid=COALESCE(NULLIF(?, ''), nicepay_tid),
+            pay_method=COALESCE(NULLIF(?, ''), pay_method),
+            updated_at=?
+        WHERE order_id=?
+        """,
+        (
+            status,
+            str(result_code or ""),
+            str(result_msg or ""),
+            json.dumps(raw_response, ensure_ascii=False) if raw_response is not None else None,
+            str(nicepay_tid or ""),
+            str(pay_method or ""),
+            utcnow().isoformat(),
+            order_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_payment_order_user(order):
+    if not order:
+        return None
+    return get_user_by_id(int(order["user_id"]))
 
 
 @app.get("/api/payments/nicepay/config")
@@ -1002,14 +1039,14 @@ async def nicepay_auth_callback(request: Request):
     form = await request.form()
     data = {k: str(v) for k, v in form.items()}
 
-    # NICEPAY v1 JS SDK는 소문자 camelCase로 응답합니다.
-    # 구버전/테스트 응답 호환을 위해 일부 대문자 파라미터도 같이 처리합니다.
-    auth_result_code = data.get("authResultCode") or data.get("AuthResultCode") or ""
-    auth_result_msg = data.get("authResultMsg") or data.get("AuthResultMsg") or ""
+    # NICEPAY v1 JS SDK는 returnUrl로 결제 인증 결과를 POST합니다.
+    # 일부 응답은 camelCase, 일부 응답은 구버전 대문자 필드를 사용하므로 모두 호환 처리합니다.
+    auth_result_code = data.get("authResultCode") or data.get("AuthResultCode") or data.get("resultCode") or data.get("ResultCode") or ""
+    auth_result_msg = data.get("authResultMsg") or data.get("AuthResultMsg") or data.get("resultMsg") or data.get("ResultMsg") or ""
     auth_token = data.get("authToken") or data.get("AuthToken") or ""
-    client_id = data.get("clientId") or data.get("MID") or ""
-    order_id = data.get("orderId") or data.get("Moid") or ""
-    amount = data.get("amount") or data.get("Amt") or "0"
+    client_id = data.get("clientId") or data.get("ClientId") or data.get("MID") or ""
+    order_id = data.get("orderId") or data.get("OrderId") or data.get("Moid") or ""
+    amount = data.get("amount") or data.get("Amount") or data.get("Amt") or "0"
     signature = data.get("signature") or data.get("Signature") or ""
     tid = data.get("tid") or data.get("TxTid") or data.get("TID") or ""
     pay_method = data.get("payMethod") or data.get("PayMethod") or ""
@@ -1019,24 +1056,27 @@ async def nicepay_auth_callback(request: Request):
         qs = urlencode({"status": status, "message": message})
         target = f"{FRONTEND_BASE_URL}/payment-result.html?{qs}"
         return f"""
-        <!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">
-        <meta http-equiv=\"refresh\" content=\"0; url={target}\">
+        <!doctype html><html lang="ko"><head><meta charset="utf-8">
+        <meta http-equiv="refresh" content="0; url={target}">
         <title>Payment Result</title></head>
         <body><script>location.href={json.dumps(target)};</script></body></html>
         """
 
     order = get_payment_order(order_id)
     if not order:
-        return redirect_html("fail", "주문정보를 찾을 수 없습니다.")
+        return redirect_html("fail", "결제 주문정보를 찾을 수 없습니다. 다시 로그인 후 결제를 진행해주세요.")
+
+    # 이미 승인 완료된 주문으로 콜백이 재호출되면 성공 페이지로 보내 중복 승인 요청을 막습니다.
+    if str(order["status"]).upper() == "PAID":
+        return redirect_html("success", "이미 STANDARD 요금제가 활성화되었습니다.")
+
+    user = get_payment_order_user(order)
+    if not user:
+        update_payment_order(order_id, "USER_NOT_FOUND", auth_result_code, "결제 주문의 회원정보가 존재하지 않습니다.", data, tid, pay_method)
+        return redirect_html("fail", "결제 주문의 회원정보가 존재하지 않습니다. 관리자에게 문의해주세요.")
 
     if auth_result_code != "0000":
-        conn = get_auth_db()
-        conn.execute(
-            "UPDATE payment_orders SET status='AUTH_FAILED', result_code=?, result_msg=?, raw_response=?, updated_at=? WHERE order_id=?",
-            (auth_result_code, auth_result_msg, json.dumps(data, ensure_ascii=False), utcnow().isoformat(), order_id),
-        )
-        conn.commit()
-        conn.close()
+        update_payment_order(order_id, "AUTH_FAILED", auth_result_code, auth_result_msg, data, tid, pay_method)
         return redirect_html("fail", auth_result_msg or "결제 인증에 실패했습니다.")
 
     try:
@@ -1044,14 +1084,21 @@ async def nicepay_auth_callback(request: Request):
     except Exception:
         amount_int = 0
 
-    if client_id != NICEPAY_CLIENT_ID or amount_int != int(order["amount"]):
-        return redirect_html("fail", "결제 금액 또는 클라이언트키 정보가 일치하지 않습니다.")
+    if client_id and client_id != NICEPAY_CLIENT_ID:
+        update_payment_order(order_id, "CLIENT_ID_MISMATCH", auth_result_code, "클라이언트키 불일치", data, tid, pay_method)
+        return redirect_html("fail", "결제 클라이언트키 정보가 일치하지 않습니다.")
+
+    if amount_int != int(order["amount"]):
+        update_payment_order(order_id, "AMOUNT_MISMATCH", auth_result_code, "결제 금액 불일치", data, tid, pay_method)
+        return redirect_html("fail", "결제 금액이 일치하지 않습니다.")
 
     expected_signature = nicepay_sha256(auth_token + client_id + str(amount_int) + NICEPAY_SECRET_KEY)
     if signature and signature.lower() != expected_signature.lower():
+        update_payment_order(order_id, "SIGNATURE_FAILED", auth_result_code, "위변조 검증 실패", data, tid, pay_method)
         return redirect_html("fail", "결제 인증 위변조 검증에 실패했습니다.")
 
     if not tid:
+        update_payment_order(order_id, "NO_TID", auth_result_code, "결제 승인키 없음", data, tid, pay_method)
         return redirect_html("fail", "결제 승인키가 없습니다.")
 
     approve_url = f"{NICEPAY_API_BASE.rstrip('/')}/v1/payments/{tid}"
@@ -1069,50 +1116,43 @@ async def nicepay_auth_callback(request: Request):
         except Exception:
             approve_data = {"raw": res.text, "status_code": res.status_code}
     except Exception as e:
-        conn = get_auth_db()
-        conn.execute(
-            "UPDATE payment_orders SET status='APPROVE_ERROR', result_msg=?, raw_response=?, updated_at=? WHERE order_id=?",
-            (str(e), json.dumps(data, ensure_ascii=False), utcnow().isoformat(), order_id),
-        )
-        conn.commit()
-        conn.close()
+        update_payment_order(order_id, "APPROVE_ERROR", "", str(e), data, tid, pay_method)
         return redirect_html("fail", "결제 승인 요청 중 오류가 발생했습니다.")
 
     result_code = str(approve_data.get("resultCode", approve_data.get("ResultCode", "")))
     result_msg = str(approve_data.get("resultMsg", approve_data.get("ResultMsg", "")))
-    approve_amount = int(approve_data.get("amount", approve_data.get("Amt", amount_int)) or 0)
+
+    try:
+        approve_amount = int(approve_data.get("amount", approve_data.get("Amt", amount_int)) or 0)
+    except Exception:
+        approve_amount = 0
+
     approve_order_id = str(approve_data.get("orderId", approve_data.get("Moid", order_id)))
     approve_tid = str(approve_data.get("tid", approve_data.get("TID", tid)))
-    approve_status = str(approve_data.get("status", ""))
-    approve_pay_method = str(approve_data.get("payMethod", pay_method))
+    approve_status = str(approve_data.get("status", approve_data.get("Status", ""))).lower()
+    approve_pay_method = str(approve_data.get("payMethod", approve_data.get("PayMethod", pay_method)))
 
-    if result_code in NICEPAY_SUCCESS_CODES and approve_status == "paid" and approve_order_id == order_id and approve_amount == int(order["amount"]):
+    # NICEPAY 승인 성공 조건. 일부 응답에는 status가 없거나 paid 외 문구가 올 수 있어
+    # resultCode/orderId/amount 검증을 중심으로 처리합니다.
+    payment_success = (
+        result_code in NICEPAY_SUCCESS_CODES
+        and approve_order_id == order_id
+        and approve_amount == int(order["amount"])
+        and (not approve_status or approve_status in {"paid", "success", "done", "completed"})
+    )
+
+    if payment_success:
         expire_at = activate_standard_plan(int(order["user_id"]), STANDARD_PLAN_DAYS)
-        conn = get_auth_db()
-        conn.execute(
-            """
-            UPDATE payment_orders
-            SET status='PAID', nicepay_tid=?, pay_method=?, result_code=?, result_msg=?, raw_response=?, updated_at=?
-            WHERE order_id=?
-            """,
-            (approve_tid, approve_pay_method, result_code, result_msg, json.dumps(approve_data, ensure_ascii=False), utcnow().isoformat(), order_id),
-        )
-        conn.commit()
-        conn.close()
+        update_payment_order(order_id, "PAID", result_code, result_msg or "결제 승인 성공", approve_data, approve_tid, approve_pay_method)
         return redirect_html("success", f"STANDARD 요금제가 활성화되었습니다. 만료일: {expire_at.strftime('%Y-%m-%d')}")
 
-    conn = get_auth_db()
-    conn.execute(
-        """
-        UPDATE payment_orders
-        SET status='APPROVE_FAILED', nicepay_tid=?, pay_method=?, result_code=?, result_msg=?, raw_response=?, updated_at=?
-        WHERE order_id=?
-        """,
-        (approve_tid, approve_pay_method, result_code, result_msg, json.dumps(approve_data, ensure_ascii=False), utcnow().isoformat(), order_id),
-    )
-    conn.commit()
-    conn.close()
-    return redirect_html("fail", result_msg or "결제 승인에 실패했습니다.")
+    # 승인 API 인증정보 오류를 사용자가 보기 쉬운 문장으로 변환
+    user_message = result_msg or "결제 승인에 실패했습니다."
+    if "사용자 정보" in user_message or "존재하지" in user_message:
+        user_message = "NICEPAY 승인 API 인증정보가 올바르지 않습니다. Render 환경변수의 NICEPAY_CLIENT_ID와 NICEPAY_SECRET_KEY를 확인해주세요."
+
+    update_payment_order(order_id, "APPROVE_FAILED", result_code, user_message, approve_data, approve_tid, approve_pay_method)
+    return redirect_html("fail", user_message)
 
 
 @app.post("/api/admin/users/{user_id}/plan")
