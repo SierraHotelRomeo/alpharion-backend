@@ -8,3 +8,4 @@ pydantic[email]
 passlib
 python-jose[cryptography]
 python-multipart
+email-validator

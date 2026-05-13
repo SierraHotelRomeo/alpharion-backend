@@ -14,8 +14,9 @@ from typing import Optional
 import numpy as np
 import requests
 import yfinance as yf
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
@@ -64,6 +65,23 @@ BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "codegeneva@naver.com")
 BREVO_FROM_NAME = os.getenv("BREVO_FROM_NAME", "Alpharion AI Market Watch")
 PASSWORD_FIND_CODE_EXPIRE_MINUTES = int(os.getenv("PASSWORD_FIND_CODE_EXPIRE_MINUTES", "10"))
 
+# =========================================================
+# Plan / NICEPAY Payment Settings
+# =========================================================
+FREE_AI_ANALYSIS_LIMIT = int(os.getenv("FREE_AI_ANALYSIS_LIMIT", "5"))
+STANDARD_PLAN_DAYS = int(os.getenv("STANDARD_PLAN_DAYS", "365"))
+STANDARD_PLAN_AMOUNT = int(os.getenv("STANDARD_PLAN_AMOUNT", "99000"))
+STANDARD_PLAN_NAME = os.getenv("STANDARD_PLAN_NAME", "Alpharion Standard 1년 이용권")
+
+# NICEPAY 개발자센터에서 발급받은 값만 사용합니다.
+# NICEPAY_CLIENT_ID: 결제창 호출용 클라이언트키
+# NICEPAY_SECRET_KEY: 서버 승인용 시크릿키
+# 기존에 NICEPAY_MERCHANT_KEY 이름으로 넣어둔 경우도 자동 호환됩니다.
+NICEPAY_CLIENT_ID = os.getenv("NICEPAY_CLIENT_ID", "")
+NICEPAY_SECRET_KEY = os.getenv("NICEPAY_SECRET_KEY", "") or os.getenv("NICEPAY_MERCHANT_KEY", "")
+NICEPAY_API_BASE = os.getenv("NICEPAY_API_BASE", "https://api.nicepay.co.kr")
+NICEPAY_SUCCESS_CODES = {"0000"}
+
 # bcrypt 72-byte 문제를 피하기 위해 pbkdf2_sha256 사용
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
@@ -108,6 +126,12 @@ class PasswordFindRequest(BaseModel):
 class PasswordFindConfirmRequest(BaseModel):
     email: EmailStr
     verification_code: str
+
+
+class AdminPlanUpdateRequest(BaseModel):
+    plan_type: str
+    plan_days: Optional[int] = STANDARD_PLAN_DAYS
+    reset_usage: bool = False
 
 
 def validate_runtime_config():
@@ -195,7 +219,31 @@ def init_auth_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payment_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            plan_type TEXT NOT NULL DEFAULT 'STANDARD',
+            status TEXT NOT NULL DEFAULT 'READY',
+            nicepay_tid TEXT,
+            pay_method TEXT,
+            result_code TEXT,
+            result_msg TEXT,
+            raw_response TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
     # 기존 서버 DB를 그대로 쓰는 경우를 위한 안전 마이그레이션
+    ensure_column(conn, "users", "plan_type", "plan_type TEXT DEFAULT 'FREE'")
+    ensure_column(conn, "users", "plan_expire_at", "plan_expire_at TEXT")
+    ensure_column(conn, "users", "ai_analysis_count", "ai_analysis_count INTEGER DEFAULT 0")
+    ensure_column(conn, "users", "last_ai_analysis_at", "last_ai_analysis_at TEXT")
     ensure_column(conn, "users", "recovery_code_hash", "recovery_code_hash TEXT")
     ensure_column(conn, "users", "terms_accepted", "terms_accepted INTEGER DEFAULT 0")
     ensure_column(conn, "users", "password_plain", "password_plain TEXT")
@@ -370,14 +418,100 @@ def get_user_by_id(user_id: int):
     return user
 
 
+def get_effective_plan_type(user):
+    if not user:
+        return "FREE"
+    plan_type = (user["plan_type"] or "FREE").upper() if "plan_type" in user.keys() else "FREE"
+    plan_expire_at = user["plan_expire_at"] if "plan_expire_at" in user.keys() else None
+
+    if plan_type == "STANDARD" and plan_expire_at:
+        try:
+            if utcnow() > datetime.fromisoformat(plan_expire_at):
+                downgrade_user_to_free(user["id"])
+                return "FREE"
+        except Exception:
+            downgrade_user_to_free(user["id"])
+            return "FREE"
+    return plan_type if plan_type in {"FREE", "STANDARD"} else "FREE"
+
+
 def public_user(user):
     if not user:
         return None
+    plan_type = get_effective_plan_type(user)
+    count = int(user["ai_analysis_count"] or 0) if "ai_analysis_count" in user.keys() else 0
+    remaining = None if plan_type == "STANDARD" else max(FREE_AI_ANALYSIS_LIMIT - count, 0)
     return {
         "id": user["id"],
         "email": user["email"],
         "created_at": user["created_at"],
+        "plan_type": plan_type,
+        "plan_expire_at": user["plan_expire_at"] if "plan_expire_at" in user.keys() else None,
+        "ai_analysis_count": count,
+        "free_ai_limit": FREE_AI_ANALYSIS_LIMIT,
+        "ai_remaining": remaining,
     }
+
+
+def downgrade_user_to_free(user_id: int):
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE users
+        SET plan_type='FREE', plan_expire_at=NULL, updated_at=?
+        WHERE id=?
+        """,
+        (utcnow().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def activate_standard_plan(user_id: int, days: int = STANDARD_PLAN_DAYS):
+    expire_at = utcnow() + timedelta(days=days)
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE users
+        SET plan_type='STANDARD', plan_expire_at=?, updated_at=?
+        WHERE id=?
+        """,
+        (expire_at.isoformat(), utcnow().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+    return expire_at
+
+
+def check_and_consume_ai_usage(user):
+    plan_type = get_effective_plan_type(user)
+    if plan_type == "STANDARD":
+        return
+
+    count = int(user["ai_analysis_count"] or 0) if "ai_analysis_count" in user.keys() else 0
+    if count >= FREE_AI_ANALYSIS_LIMIT:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "FREE_LIMIT_EXCEEDED",
+                "message": "Free 요금제의 AI 종목분석 5회 사용을 모두 소진했습니다.",
+                "limit": FREE_AI_ANALYSIS_LIMIT,
+                "used": count,
+                "payment_url": "/payment.html",
+            },
+        )
+
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE users
+        SET ai_analysis_count=COALESCE(ai_analysis_count, 0)+1, last_ai_analysis_at=?, updated_at=?
+        WHERE id=?
+        """,
+        (utcnow().isoformat(), utcnow().isoformat(), user["id"]),
+    )
+    conn.commit()
+    conn.close()
 
 
 def make_captcha_question():
@@ -594,6 +728,9 @@ def admin_public_user(row):
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "terms_accepted": bool(row["terms_accepted"]),
+        "plan_type": row["plan_type"] if "plan_type" in row.keys() else "FREE",
+        "plan_expire_at": row["plan_expire_at"] if "plan_expire_at" in row.keys() else None,
+        "ai_analysis_count": int(row["ai_analysis_count"] or 0) if "ai_analysis_count" in row.keys() else 0,
     }
 
 @app.get("/api/auth/me")
@@ -742,7 +879,7 @@ def admin_users(
         ).fetchone()["cnt"]
         rows = conn.execute(
             """
-            SELECT id, email, terms_accepted, created_at, updated_at
+            SELECT id, email, terms_accepted, created_at, updated_at, plan_type, plan_expire_at, ai_analysis_count
             FROM users
             WHERE lower(email) LIKE ?
             ORDER BY id DESC
@@ -754,7 +891,7 @@ def admin_users(
         total = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
         rows = conn.execute(
             """
-            SELECT id, email, terms_accepted, created_at, updated_at
+            SELECT id, email, terms_accepted, created_at, updated_at, plan_type, plan_expire_at, ai_analysis_count
             FROM users
             ORDER BY id DESC
             LIMIT ? OFFSET ?
@@ -785,6 +922,231 @@ def admin_delete_user(user_id: int, admin_ok=Depends(verify_admin_secret)):
     conn.close()
 
     return {"ok": True, "message": "회원 계정이 삭제되었습니다.", "deleted_user_id": user_id, "deleted_email": user["email"]}
+
+
+# =========================================================
+# NICEPAY Payment API
+# =========================================================
+def nicepay_sha256(text: str):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def nicepay_basic_auth_header():
+    # NICEPAY Basic 인증은 시크릿키 뒤에 콜론(:)을 붙인 값을 base64 인코딩합니다.
+    # 예: Authorization: Basic base64(secretKey + ":")
+    raw = f"{NICEPAY_SECRET_KEY}:".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("utf-8")
+
+
+def nicepay_is_configured():
+    return bool(NICEPAY_CLIENT_ID and NICEPAY_SECRET_KEY)
+
+
+def make_order_id(user_id: int):
+    return f"AMW{user_id}{utcnow().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
+
+
+def get_payment_order(order_id: str):
+    conn = get_auth_db()
+    row = conn.execute("SELECT * FROM payment_orders WHERE order_id=?", (order_id,)).fetchone()
+    conn.close()
+    return row
+
+
+@app.get("/api/payments/nicepay/config")
+def nicepay_config():
+    return {
+        "ok": True,
+        "configured": nicepay_is_configured(),
+        "amount": STANDARD_PLAN_AMOUNT,
+        "goods_name": STANDARD_PLAN_NAME,
+        "plan_days": STANDARD_PLAN_DAYS,
+    }
+
+
+@app.post("/api/payments/nicepay/prepare")
+def nicepay_prepare(user=Depends(get_current_user)):
+    if not nicepay_is_configured():
+        raise HTTPException(status_code=500, detail="NICEPAY 환경변수가 설정되지 않았습니다. NICEPAY_CLIENT_ID, NICEPAY_SECRET_KEY를 확인하세요.")
+
+    order_id = make_order_id(user["id"])
+    now = utcnow().isoformat()
+    conn = get_auth_db()
+    conn.execute(
+        """
+        INSERT INTO payment_orders (order_id, user_id, amount, plan_type, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'STANDARD', 'READY', ?, ?)
+        """,
+        (order_id, user["id"], STANDARD_PLAN_AMOUNT, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "client_id": NICEPAY_CLIENT_ID,
+        "method": "card",
+        "order_id": order_id,
+        "amount": STANDARD_PLAN_AMOUNT,
+        "goods_name": STANDARD_PLAN_NAME,
+        "return_url": f"{API_PUBLIC_BASE}/api/payments/nicepay/auth-callback",
+        "buyer_name": user["email"].split("@")[0],
+        "buyer_email": user["email"],
+        "mall_user_id": str(user["id"]),
+    }
+
+
+@app.post("/api/payments/nicepay/auth-callback", response_class=HTMLResponse)
+async def nicepay_auth_callback(request: Request):
+    form = await request.form()
+    data = {k: str(v) for k, v in form.items()}
+
+    # NICEPAY v1 JS SDK는 소문자 camelCase로 응답합니다.
+    # 구버전/테스트 응답 호환을 위해 일부 대문자 파라미터도 같이 처리합니다.
+    auth_result_code = data.get("authResultCode") or data.get("AuthResultCode") or ""
+    auth_result_msg = data.get("authResultMsg") or data.get("AuthResultMsg") or ""
+    auth_token = data.get("authToken") or data.get("AuthToken") or ""
+    client_id = data.get("clientId") or data.get("MID") or ""
+    order_id = data.get("orderId") or data.get("Moid") or ""
+    amount = data.get("amount") or data.get("Amt") or "0"
+    signature = data.get("signature") or data.get("Signature") or ""
+    tid = data.get("tid") or data.get("TxTid") or data.get("TID") or ""
+    pay_method = data.get("payMethod") or data.get("PayMethod") or ""
+
+    def redirect_html(status: str, message: str):
+        from urllib.parse import urlencode
+        qs = urlencode({"status": status, "message": message})
+        target = f"{FRONTEND_BASE_URL}/payment-result.html?{qs}"
+        return f"""
+        <!doctype html><html lang=\"ko\"><head><meta charset=\"utf-8\">
+        <meta http-equiv=\"refresh\" content=\"0; url={target}\">
+        <title>Payment Result</title></head>
+        <body><script>location.href={json.dumps(target)};</script></body></html>
+        """
+
+    order = get_payment_order(order_id)
+    if not order:
+        return redirect_html("fail", "주문정보를 찾을 수 없습니다.")
+
+    if auth_result_code != "0000":
+        conn = get_auth_db()
+        conn.execute(
+            "UPDATE payment_orders SET status='AUTH_FAILED', result_code=?, result_msg=?, raw_response=?, updated_at=? WHERE order_id=?",
+            (auth_result_code, auth_result_msg, json.dumps(data, ensure_ascii=False), utcnow().isoformat(), order_id),
+        )
+        conn.commit()
+        conn.close()
+        return redirect_html("fail", auth_result_msg or "결제 인증에 실패했습니다.")
+
+    try:
+        amount_int = int(str(amount).replace(",", ""))
+    except Exception:
+        amount_int = 0
+
+    if client_id != NICEPAY_CLIENT_ID or amount_int != int(order["amount"]):
+        return redirect_html("fail", "결제 금액 또는 클라이언트키 정보가 일치하지 않습니다.")
+
+    expected_signature = nicepay_sha256(auth_token + client_id + str(amount_int) + NICEPAY_SECRET_KEY)
+    if signature and signature.lower() != expected_signature.lower():
+        return redirect_html("fail", "결제 인증 위변조 검증에 실패했습니다.")
+
+    if not tid:
+        return redirect_html("fail", "결제 승인키가 없습니다.")
+
+    approve_url = f"{NICEPAY_API_BASE.rstrip('/')}/v1/payments/{tid}"
+    approve_payload = {"amount": amount_int}
+    headers = {
+        "Authorization": nicepay_basic_auth_header(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        res = requests.post(approve_url, headers=headers, json=approve_payload, timeout=25)
+        try:
+            approve_data = res.json()
+        except Exception:
+            approve_data = {"raw": res.text, "status_code": res.status_code}
+    except Exception as e:
+        conn = get_auth_db()
+        conn.execute(
+            "UPDATE payment_orders SET status='APPROVE_ERROR', result_msg=?, raw_response=?, updated_at=? WHERE order_id=?",
+            (str(e), json.dumps(data, ensure_ascii=False), utcnow().isoformat(), order_id),
+        )
+        conn.commit()
+        conn.close()
+        return redirect_html("fail", "결제 승인 요청 중 오류가 발생했습니다.")
+
+    result_code = str(approve_data.get("resultCode", approve_data.get("ResultCode", "")))
+    result_msg = str(approve_data.get("resultMsg", approve_data.get("ResultMsg", "")))
+    approve_amount = int(approve_data.get("amount", approve_data.get("Amt", amount_int)) or 0)
+    approve_order_id = str(approve_data.get("orderId", approve_data.get("Moid", order_id)))
+    approve_tid = str(approve_data.get("tid", approve_data.get("TID", tid)))
+    approve_status = str(approve_data.get("status", ""))
+    approve_pay_method = str(approve_data.get("payMethod", pay_method))
+
+    if result_code in NICEPAY_SUCCESS_CODES and approve_status == "paid" and approve_order_id == order_id and approve_amount == int(order["amount"]):
+        expire_at = activate_standard_plan(int(order["user_id"]), STANDARD_PLAN_DAYS)
+        conn = get_auth_db()
+        conn.execute(
+            """
+            UPDATE payment_orders
+            SET status='PAID', nicepay_tid=?, pay_method=?, result_code=?, result_msg=?, raw_response=?, updated_at=?
+            WHERE order_id=?
+            """,
+            (approve_tid, approve_pay_method, result_code, result_msg, json.dumps(approve_data, ensure_ascii=False), utcnow().isoformat(), order_id),
+        )
+        conn.commit()
+        conn.close()
+        return redirect_html("success", f"STANDARD 요금제가 활성화되었습니다. 만료일: {expire_at.strftime('%Y-%m-%d')}")
+
+    conn = get_auth_db()
+    conn.execute(
+        """
+        UPDATE payment_orders
+        SET status='APPROVE_FAILED', nicepay_tid=?, pay_method=?, result_code=?, result_msg=?, raw_response=?, updated_at=?
+        WHERE order_id=?
+        """,
+        (approve_tid, approve_pay_method, result_code, result_msg, json.dumps(approve_data, ensure_ascii=False), utcnow().isoformat(), order_id),
+    )
+    conn.commit()
+    conn.close()
+    return redirect_html("fail", result_msg or "결제 승인에 실패했습니다.")
+
+
+@app.post("/api/admin/users/{user_id}/plan")
+def admin_update_user_plan(user_id: int, req: AdminPlanUpdateRequest, admin_ok=Depends(verify_admin_secret)):
+    plan_type = (req.plan_type or "FREE").upper()
+    if plan_type not in {"FREE", "STANDARD"}:
+        raise HTTPException(status_code=400, detail="plan_type은 FREE 또는 STANDARD만 가능합니다.")
+
+    conn = get_auth_db()
+    user = conn.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="해당 회원을 찾을 수 없습니다.")
+
+    if plan_type == "STANDARD":
+        days = int(req.plan_days or STANDARD_PLAN_DAYS)
+        expire_at = utcnow() + timedelta(days=days)
+        conn.execute(
+            "UPDATE users SET plan_type='STANDARD', plan_expire_at=?, updated_at=? WHERE id=?",
+            (expire_at.isoformat(), utcnow().isoformat(), user_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET plan_type='FREE', plan_expire_at=NULL, updated_at=? WHERE id=?",
+            (utcnow().isoformat(), user_id),
+        )
+
+    if req.reset_usage:
+        conn.execute("UPDATE users SET ai_analysis_count=0, last_ai_analysis_at=NULL WHERE id=?", (user_id,))
+
+    conn.commit()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    return {"ok": True, "user": public_user(row)}
 
 
 # =========================================================
@@ -920,7 +1282,7 @@ def search_stock(q: str = Query("")):
 
 
 @app.get("/api/stock/{symbol}")
-def get_stock(symbol: str, period: str = "1y"):
+def get_stock(symbol: str, period: str = "1y", user=Depends(get_current_user)):
     original_input = symbol
     symbol = normalize_symbol(symbol)
     period = validate_period(period)
@@ -983,6 +1345,8 @@ def get_stock(symbol: str, period: str = "1y"):
             forecast_change=forecast["forecast_change_pct"],
             news_score=news["score"],
         )
+
+        check_and_consume_ai_usage(user)
 
         return {
             "symbol": symbol.upper(),
