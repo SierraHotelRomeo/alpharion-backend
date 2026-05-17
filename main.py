@@ -239,7 +239,7 @@ def init_auth_db():
             user_id INTEGER NOT NULL,
             amount INTEGER NOT NULL,
             status TEXT NOT NULL,
-            goods_name TEXT NOT NULL,
+            goods_name TEXT DEFAULT 'Alpharion Standard 1개월 이용권',
             auth_token TEXT,
             tid TEXT,
             raw_prepare TEXT,
@@ -249,6 +249,15 @@ def init_auth_db():
         )
         """
     )
+
+    # 기존 payment_orders 테이블이 이미 만들어진 경우에도 새 컬럼을 자동 추가합니다.
+    # Render Persistent Disk의 SQLite DB는 재배포 후에도 유지되므로 CREATE TABLE IF NOT EXISTS만으로는
+    # 기존 테이블 구조가 바뀌지 않습니다. 따라서 결제 오류 방지를 위해 ALTER TABLE 마이그레이션이 필요합니다.
+    ensure_column(conn, "payment_orders", "goods_name", "goods_name TEXT DEFAULT 'Alpharion Standard 1개월 이용권'")
+    ensure_column(conn, "payment_orders", "auth_token", "auth_token TEXT")
+    ensure_column(conn, "payment_orders", "tid", "tid TEXT")
+    ensure_column(conn, "payment_orders", "raw_prepare", "raw_prepare TEXT")
+    ensure_column(conn, "payment_orders", "raw_approve", "raw_approve TEXT")
 
     conn.commit()
     conn.close()
