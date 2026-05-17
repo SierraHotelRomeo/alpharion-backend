@@ -1392,36 +1392,117 @@ US_SCREENER_UNIVERSE = [
     ("SPDR S&P 500 ETF", "SPY"), ("Invesco QQQ", "QQQ"), ("Technology ETF", "XLK"), ("Semiconductor ETF", "SOXX"),
 ]
 
+SCREENER_SECTOR_UNIVERSE = {
+    "AI": {
+        "KR": [("삼성전자", "005930.KS"), ("SK하이닉스", "000660.KS"), ("NAVER", "035420.KS"), ("카카오", "035720.KS")],
+        "US": [("NVIDIA", "NVDA"), ("Microsoft", "MSFT"), ("Alphabet A", "GOOGL"), ("Meta Platforms", "META"), ("Palantir", "PLTR"), ("AMD", "AMD"), ("Broadcom", "AVGO"), ("Super Micro Computer", "SMCI")],
+    },
+    "SEMICONDUCTOR": {
+        "KR": [("삼성전자", "005930.KS"), ("SK하이닉스", "000660.KS"), ("DB하이텍", "000990.KS"), ("한미반도체", "042700.KS"), ("이오테크닉스", "039030.KQ")],
+        "US": [("NVIDIA", "NVDA"), ("AMD", "AMD"), ("Broadcom", "AVGO"), ("TSMC", "TSM"), ("Intel", "INTC"), ("Qualcomm", "QCOM"), ("Micron", "MU"), ("Semiconductor ETF", "SOXX")],
+    },
+    "BATTERY": {
+        "KR": [("LG에너지솔루션", "373220.KS"), ("삼성SDI", "006400.KS"), ("LG화학", "051910.KS"), ("포스코퓨처엠", "003670.KS"), ("에코프로", "086520.KQ")],
+        "US": [("Tesla", "TSLA"), ("Albemarle", "ALB"), ("QuantumScape", "QS"), ("Global X Lithium ETF", "LIT")],
+    },
+    "BIO": {
+        "KR": [("셀트리온", "068270.KS"), ("삼성바이오로직스", "207940.KS"), ("알테오젠", "196170.KQ"), ("HLB", "028300.KQ")],
+        "US": [("Eli Lilly", "LLY"), ("Johnson & Johnson", "JNJ"), ("Pfizer", "PFE"), ("Merck", "MRK"), ("Moderna", "MRNA")],
+    },
+    "DEFENSE": {
+        "KR": [("한화에어로스페이스", "012450.KS"), ("현대로템", "064350.KS"), ("한화오션", "042660.KS"), ("LIG넥스원", "079550.KS"), ("한국항공우주", "047810.KS")],
+        "US": [("Lockheed Martin", "LMT"), ("Northrop Grumman", "NOC"), ("RTX", "RTX"), ("General Dynamics", "GD")],
+    },
+    "NUCLEAR": {
+        "KR": [("두산에너빌리티", "034020.KS"), ("한전기술", "052690.KS"), ("한전KPS", "051600.KS"), ("한국전력", "015760.KS")],
+        "US": [("Cameco", "CCJ"), ("Constellation Energy", "CEG"), ("Uranium Energy", "UEC"), ("NuScale Power", "SMR")],
+    },
+    "ROBOT": {
+        "KR": [("레인보우로보틱스", "277810.KQ"), ("로보티즈", "108490.KQ"), ("유진로봇", "056080.KQ"), ("두산로보틱스", "454910.KS")],
+        "US": [("Tesla", "TSLA"), ("Intuitive Surgical", "ISRG"), ("Rockwell Automation", "ROK"), ("Teradyne", "TER")],
+    },
+    "SHIPBUILDING": {
+        "KR": [("HD현대중공업", "329180.KS"), ("HD한국조선해양", "009540.KS"), ("한화오션", "042660.KS"), ("삼성중공업", "010140.KS"), ("팬오션", "028670.KS"), ("HMM", "011200.KS"), ("대한해운", "005880.KS")],
+        "US": [("ZIM Integrated Shipping", "ZIM"), ("Star Bulk Carriers", "SBLK"), ("Danaos", "DAC"), ("Matson", "MATX")],
+    },
+    "AUTO": {
+        "KR": [("현대차", "005380.KS"), ("기아", "000270.KS"), ("현대모비스", "012330.KS"), ("HL만도", "204320.KS")],
+        "US": [("Tesla", "TSLA"), ("Ford", "F"), ("General Motors", "GM"), ("Rivian", "RIVN")],
+    },
+    "BANK": {
+        "KR": [("KB금융", "105560.KS"), ("신한지주", "055550.KS"), ("하나금융지주", "086790.KS"), ("우리금융지주", "316140.KS"), ("기업은행", "024110.KS")],
+        "US": [("JPMorgan", "JPM"), ("Bank of America", "BAC"), ("Wells Fargo", "WFC"), ("Goldman Sachs", "GS"), ("Morgan Stanley", "MS")],
+    },
+    "INTERNET": {
+        "KR": [("NAVER", "035420.KS"), ("카카오", "035720.KS"), ("엔씨소프트", "036570.KS"), ("크래프톤", "259960.KS")],
+        "US": [("Alphabet A", "GOOGL"), ("Meta Platforms", "META"), ("Amazon", "AMZN"), ("Netflix", "NFLX")],
+    },
+    "ETF": {
+        "KR": [("KODEX 200", "069500.KS"), ("TIGER 200", "102110.KS"), ("KODEX 코스닥150", "229200.KS")],
+        "US": [("SPDR S&P 500 ETF", "SPY"), ("Invesco QQQ", "QQQ"), ("Technology ETF", "XLK"), ("Semiconductor ETF", "SOXX")],
+    },
+}
+
+SCREENER_SECTOR_ALIASES = {
+    "ALL": "ALL", "": "ALL",
+    "AI": "AI", "인공지능": "AI",
+    "반도체": "SEMICONDUCTOR", "SEMICONDUCTOR": "SEMICONDUCTOR", "HBM": "SEMICONDUCTOR",
+    "2차전지": "BATTERY", "배터리": "BATTERY", "BATTERY": "BATTERY",
+    "바이오": "BIO", "헬스케어": "BIO", "BIO": "BIO",
+    "방산": "DEFENSE", "우주항공": "DEFENSE", "DEFENSE": "DEFENSE",
+    "원전": "NUCLEAR", "에너지": "NUCLEAR", "NUCLEAR": "NUCLEAR",
+    "로봇": "ROBOT", "ROBOT": "ROBOT",
+    "조선": "SHIPBUILDING", "해운": "SHIPBUILDING", "SHIPPING": "SHIPBUILDING", "SHIPBUILDING": "SHIPBUILDING",
+    "자동차": "AUTO", "모빌리티": "AUTO", "AUTO": "AUTO",
+    "은행": "BANK", "금융": "BANK", "BANK": "BANK",
+    "인터넷": "INTERNET", "플랫폼": "INTERNET", "INTERNET": "INTERNET",
+    "ETF": "ETF", "지수": "ETF",
+}
+
+
+def normalize_screener_sector(keyword: str):
+    text = str(keyword or "ALL").strip()
+    return SCREENER_SECTOR_ALIASES.get(text, SCREENER_SECTOR_ALIASES.get(text.upper(), "ALL"))
+
 
 def build_screener_universe(market: str, keyword: str, limit: int):
     market = (market or "ALL").upper()
-    keyword_norm = normalize_text(keyword or "")
+    sector = normalize_screener_sector(keyword)
     result = []
     seen = set()
+    max_limit = max(1, min(int(limit or 40), 200))
 
     def add_item(name, symbol, item_market):
-        if symbol in seen:
+        if not symbol or symbol in seen:
             return
-        if keyword_norm:
-            hay = normalize_text(f"{name} {symbol} {item_market}")
-            if keyword_norm not in hay:
-                return
         seen.add(symbol)
-        result.append({"name": name, "symbol": symbol, "market": item_market})
+        result.append({"name": name or symbol, "symbol": symbol, "market": item_market})
 
+    # 사용자가 섹터를 선택한 경우: 해당 섹터의 사전 정의 유니버스만 검색합니다.
+    if sector != "ALL" and sector in SCREENER_SECTOR_UNIVERSE:
+        sector_items = SCREENER_SECTOR_UNIVERSE[sector]
+        if market in {"KR", "ALL"}:
+            for name, symbol in sector_items.get("KR", []):
+                add_item(name, symbol, "Korea")
+        if market in {"US", "ALL"}:
+            for name, symbol in sector_items.get("US", []):
+                add_item(name, symbol, "US")
+        return result[:max_limit]
+
+    # 전체 섹터인 경우: 기존처럼 한국 대표 종목 + KRX 일부 + 미국 주요주를 대상으로 검색합니다.
     if market in {"KR", "ALL"}:
         for name, symbol in KOREAN_NAME_MAP.items():
             add_item(name, symbol, "Korea")
         for item in get_krx_stocks():
             add_item(item.get("name") or item.get("symbol"), item.get("symbol"), item.get("market") or "Korea")
-            if len(result) >= limit and market == "KR":
+            if len(result) >= max_limit and market == "KR":
                 break
 
     if market in {"US", "ALL"}:
         for name, symbol in US_SCREENER_UNIVERSE:
             add_item(name, symbol, "US")
 
-    return result[:max(1, min(int(limit or 40), 120))]
+    return result[:max_limit]
 
 
 def safe_float_value(value, default=None):
@@ -1512,7 +1593,7 @@ def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financ
     period_return = ((close_prices[-1] - close_prices[0]) / close_prices[0]) * 100
 
     pattern_checks = detect_chart_patterns(close_prices, ma5, ma20, ma60, high_prices, low_prices)
-    pattern_ok = True if not selected_patterns else any(pattern_checks.get(p) for p in selected_patterns)
+    pattern_ok = True if not selected_patterns else all(pattern_checks.get(p) for p in selected_patterns)
 
     info = {}
     try:
@@ -1530,7 +1611,7 @@ def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financ
     currency = "KRW" if symbol.endswith(".KS") or symbol.endswith(".KQ") else "USD"
     name = item.get("name") or info.get("shortName") or info.get("longName") or symbol
 
-    summary = f"선택 조건 {len(matched_labels)}개 매칭, 1년 수익률 {round(period_return, 2)}%, RSI {round(float(rsi), 1)}"
+    summary = f"선택한 모든 조건을 만족했습니다. 매칭 {len(matched_labels)}개, 1년 수익률 {round(period_return, 2)}%, RSI {round(float(rsi), 1)}"
     return {
         "symbol": symbol,
         "name": name,
