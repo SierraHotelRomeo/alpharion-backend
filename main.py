@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 try:
     import FinanceDataReader as fdr
@@ -141,12 +141,26 @@ class NicepayPrepareRequest(BaseModel):
     pass
 
 
+class ScreenerFilterItem(BaseModel):
+    type: str
+    key: str
+
+
+class ScreenerFilterGroup(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    operator: str = "AND"
+    filters: List[ScreenerFilterItem] = Field(default_factory=list)
+
+
 class ScreenerRequest(BaseModel):
     market: str = "ALL"
     keyword: str = ""
     limit: int = 40
-    patterns: List[str] = []
-    financials: List[str] = []
+    patterns: List[str] = Field(default_factory=list)
+    financials: List[str] = Field(default_factory=list)
+    group_operator: str = "AND"
+    groups: List[ScreenerFilterGroup] = Field(default_factory=list)
 
 
 def validate_runtime_config():
@@ -1576,7 +1590,93 @@ def evaluate_financial_filters(info: dict):
     return checks
 
 
-def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financials: list):
+def normalize_screener_operator(value: str):
+    value = str(value or "AND").upper().strip()
+    return "OR" if value == "OR" else "AND"
+
+
+def normalize_screener_filter_groups(req: ScreenerRequest):
+    groups = []
+
+    # 새 방식: 사용자가 직접 만든 그룹 구조
+    for idx, group in enumerate(req.groups or []):
+        filters = []
+        for f in group.filters or []:
+            f_type = str(f.type or "").strip().lower()
+            key = str(f.key or "").strip()
+            if f_type == "pattern" and key in SCREENER_PATTERN_LABELS:
+                filters.append({"type": "pattern", "key": key})
+            elif f_type == "financial" and key in SCREENER_FINANCIAL_LABELS:
+                filters.append({"type": "financial", "key": key})
+        if filters:
+            groups.append({
+                "id": group.id or f"G{idx + 1}",
+                "name": group.name or f"그룹 {idx + 1}",
+                "operator": normalize_screener_operator(group.operator),
+                "filters": filters,
+            })
+
+    # 기존 방식 호환: patterns/financials만 넘어오는 경우 전체 AND 그룹으로 처리
+    if not groups:
+        legacy_filters = []
+        for p in (req.patterns or []):
+            if p in SCREENER_PATTERN_LABELS:
+                legacy_filters.append({"type": "pattern", "key": p})
+        for f in (req.financials or []):
+            if f in SCREENER_FINANCIAL_LABELS:
+                legacy_filters.append({"type": "financial", "key": f})
+        if legacy_filters:
+            groups.append({"id": "G1", "name": "기본 그룹", "operator": "AND", "filters": legacy_filters})
+
+    return groups
+
+
+def get_screener_label(filter_type: str, key: str):
+    if filter_type == "pattern":
+        return SCREENER_PATTERN_LABELS.get(key, key)
+    if filter_type == "financial":
+        return SCREENER_FINANCIAL_LABELS.get(key, key)
+    return key
+
+
+def evaluate_screener_groups(pattern_checks: dict, financial_checks: dict, groups: list, group_operator: str = "AND"):
+    group_operator = normalize_screener_operator(group_operator)
+    group_results = []
+    matched_keys = []
+    matched_labels = []
+
+    for group in groups:
+        values = []
+        true_count = 0
+        for f in group.get("filters", []):
+            f_type = f.get("type")
+            key = f.get("key")
+            passed = bool(pattern_checks.get(key)) if f_type == "pattern" else bool(financial_checks.get(key))
+            values.append(passed)
+            if passed:
+                true_count += 1
+                matched_keys.append(key)
+                matched_labels.append(get_screener_label(f_type, key))
+
+        op = normalize_screener_operator(group.get("operator", "AND"))
+        group_passed = any(values) if op == "OR" else all(values)
+        group_results.append({
+            "id": group.get("id"),
+            "name": group.get("name"),
+            "operator": op,
+            "passed": bool(group_passed),
+            "total": len(values),
+            "matched": true_count,
+        })
+
+    if not group_results:
+        return False, [], [], []
+
+    final_ok = any(g["passed"] for g in group_results) if group_operator == "OR" else all(g["passed"] for g in group_results)
+    return bool(final_ok), matched_keys, matched_labels, group_results
+
+
+def analyze_screener_symbol(item: dict, filter_groups: list, group_operator: str = "AND"):
     symbol = item["symbol"]
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="1y", interval="1d").dropna()
@@ -1593,7 +1693,6 @@ def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financ
     period_return = ((close_prices[-1] - close_prices[0]) / close_prices[0]) * 100
 
     pattern_checks = detect_chart_patterns(close_prices, ma5, ma20, ma60, high_prices, low_prices)
-    pattern_ok = True if not selected_patterns else all(pattern_checks.get(p) for p in selected_patterns)
 
     info = {}
     try:
@@ -1601,17 +1700,18 @@ def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financ
     except Exception:
         info = {}
     financial_checks = evaluate_financial_filters(info)
-    financial_ok = True if not selected_financials else all(financial_checks.get(f) for f in selected_financials)
 
-    if not (pattern_ok and financial_ok):
+    final_ok, matched_keys, matched_labels, group_results = evaluate_screener_groups(
+        pattern_checks, financial_checks, filter_groups, group_operator
+    )
+
+    if not final_ok:
         return None
 
-    matched_keys = [p for p in selected_patterns if pattern_checks.get(p)] + [f for f in selected_financials if financial_checks.get(f)]
-    matched_labels = [SCREENER_PATTERN_LABELS.get(k) or SCREENER_FINANCIAL_LABELS.get(k) or k for k in matched_keys]
     currency = "KRW" if symbol.endswith(".KS") or symbol.endswith(".KQ") else "USD"
     name = item.get("name") or info.get("shortName") or info.get("longName") or symbol
-
-    summary = f"선택한 모든 조건을 만족했습니다. 매칭 {len(matched_labels)}개, 1년 수익률 {round(period_return, 2)}%, RSI {round(float(rsi), 1)}"
+    logic_text = "그룹 중 하나 이상 통과" if normalize_screener_operator(group_operator) == "OR" else "모든 그룹 통과"
+    summary = f"조건검색을 통과했습니다. {logic_text}, 매칭 {len(matched_labels)}개, 1년 수익률 {round(period_return, 2)}%, RSI {round(float(rsi), 1)}"
     return {
         "symbol": symbol,
         "name": name,
@@ -1621,6 +1721,7 @@ def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financ
         "period_return": round(float(period_return), 2),
         "rsi": round(float(rsi), 1),
         "matched_labels": matched_labels,
+        "group_results": group_results,
         "summary": summary,
     }
 
@@ -1634,17 +1735,18 @@ def stock_screener(req: ScreenerRequest, user=Depends(get_current_user)):
             detail={"code": "STANDARD_REQUIRED", "message": "Stock Screener는 Standard 회원 전용 기능입니다."},
         )
 
-    selected_patterns = [p for p in (req.patterns or []) if p in SCREENER_PATTERN_LABELS]
-    selected_financials = [f for f in (req.financials or []) if f in SCREENER_FINANCIAL_LABELS]
-    if not selected_patterns and not selected_financials:
+    filter_groups = normalize_screener_filter_groups(req)
+    if not filter_groups:
         raise HTTPException(status_code=400, detail="검색할 필터를 1개 이상 선택해주세요.")
+
+    group_operator = normalize_screener_operator(req.group_operator)
 
     universe = build_screener_universe(req.market, req.keyword, req.limit)
     results = []
     errors = 0
     for item in universe:
         try:
-            row = analyze_screener_symbol(item, selected_patterns, selected_financials)
+            row = analyze_screener_symbol(item, filter_groups, group_operator)
             if row:
                 results.append(row)
         except Exception:
@@ -1659,6 +1761,8 @@ def stock_screener(req: ScreenerRequest, user=Depends(get_current_user)):
         "count": len(results),
         "checked": len(universe),
         "errors": errors,
+        "group_operator": group_operator,
+        "groups": filter_groups,
         "results": results,
     }
 
