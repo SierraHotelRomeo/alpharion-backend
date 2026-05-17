@@ -989,7 +989,7 @@ def admin_set_standard_user(user_id: int, req: AdminSetStandardRequest, admin_ok
         (
             manual_order_id,
             user_id,
-            STANDARD_PLAN_AMOUNT,
+            STANDARD_PRICE_KRW,
             goods_name,
             json.dumps({"manual_admin": True, "days": days}, ensure_ascii=False),
             json.dumps({"manual_admin": True, "paid_at": paid_at.isoformat(), "expire_at": expire_at.isoformat()}, ensure_ascii=False),
@@ -1154,6 +1154,28 @@ def nicepay_prepare(req: NicepayPrepareRequest, user=Depends(get_current_user)):
     }
 
 
+def nicepay_pick(params: dict, *names: str, default: str = ""):
+    """NICEPAY가 환경에 따라 tid/TID, orderId/order_id처럼 다른 키를 보낼 수 있어 안전하게 읽습니다."""
+    if not params:
+        return default
+    lower_map = {str(k).lower(): v for k, v in params.items()}
+    for name in names:
+        if name in params and params.get(name) not in (None, ""):
+            return params.get(name)
+        key = str(name).lower()
+        if key in lower_map and lower_map.get(key) not in (None, ""):
+            return lower_map.get(key)
+    return default
+
+
+def nicepay_to_int_amount(value):
+    text = str(value or "0").replace(",", "").strip()
+    try:
+        return int(float(text))
+    except Exception:
+        return 0
+
+
 @app.get("/api/payments/nicepay/return", response_class=HTMLResponse)
 @app.post("/api/payments/nicepay/return", response_class=HTMLResponse)
 async def nicepay_return(request: Request):
@@ -1163,27 +1185,51 @@ async def nicepay_return(request: Request):
     else:
         params = dict(request.query_params)
 
-    result_code = params.get("authResultCode") or params.get("resultCode") or ""
-    result_msg = params.get("authResultMsg") or params.get("resultMsg") or ""
-    auth_token = params.get("authToken") or ""
-    order_id = params.get("orderId") or ""
-    amount = int(params.get("amount") or 0)
+    print("NICEPAY RETURN PARAMS:", json.dumps(params, ensure_ascii=False))
+
+    result_code = str(nicepay_pick(params, "authResultCode", "resultCode", "ResultCode")).strip()
+    result_msg = str(nicepay_pick(params, "authResultMsg", "resultMsg", "ResultMsg", default="")).strip()
+    order_id = str(nicepay_pick(params, "orderId", "order_id", "OrderId", "moid", "Moid", default="")).strip()
+    amount = nicepay_to_int_amount(nicepay_pick(params, "amount", "Amount", "amt", "Amt", default="0"))
+
+    # NICEPAY 승인 API는 일반적으로 TID를 path에 넣어 호출합니다.
+    # 일부 응답에서는 authToken만 올 수 있어 authToken도 fallback으로 사용합니다.
+    tid = str(nicepay_pick(params, "tid", "TID", "Tid", default="")).strip()
+    auth_token = str(nicepay_pick(params, "authToken", "auth_token", "AuthToken", default="")).strip()
+    approve_key = tid or auth_token
 
     if result_code and result_code != "0000":
         return HTMLResponse(
             f"""
             <script>
-              alert("결제가 완료되지 않았습니다. {result_msg}");
+              alert({json.dumps('결제가 완료되지 않았습니다. ' + (result_msg or ''), ensure_ascii=False)});
               location.href="{FRONTEND_BASE_URL}/#payment";
             </script>
             """
         )
 
-    if not order_id or not auth_token or not amount:
+    if not order_id or not amount:
         return HTMLResponse(
             f"""
             <script>
-              alert("결제 승인 정보가 부족합니다.");
+              alert("결제 주문번호 또는 금액 정보가 부족합니다.");
+              location.href="{FRONTEND_BASE_URL}/#payment";
+            </script>
+            """
+        )
+
+    if not approve_key:
+        conn = get_auth_db()
+        conn.execute(
+            "UPDATE payment_orders SET status='FAILED', raw_approve=?, updated_at=? WHERE order_id=?",
+            (json.dumps({"error": "MISSING_TID_OR_AUTHTOKEN", "return_params": params}, ensure_ascii=False), utcnow().isoformat(), order_id),
+        )
+        conn.commit()
+        conn.close()
+        return HTMLResponse(
+            f"""
+            <script>
+              alert("결제 승인번호 TID를 받지 못했습니다. NICEPAY 설정을 확인해주세요.");
               location.href="{FRONTEND_BASE_URL}/#payment";
             </script>
             """
@@ -1230,20 +1276,31 @@ async def nicepay_return(request: Request):
     }
 
     try:
+        # 핵심 수정: authToken이 아니라 TID 우선으로 승인 API 호출
         approve_res = requests.post(
-            f"{NICEPAY_APPROVE_URL}/{auth_token}",
+            f"{NICEPAY_APPROVE_URL}/{approve_key}",
             headers=approve_headers,
             json=approve_payload,
             timeout=25,
         )
-        approve_data = approve_res.json() if approve_res.text else {}
+        try:
+            approve_data = approve_res.json() if approve_res.text else {}
+        except Exception:
+            approve_data = {"raw_text": approve_res.text}
 
-        if approve_res.status_code not in (200, 201) or str(approve_data.get("resultCode")) != "0000":
-            msg = approve_data.get("resultMsg") or approve_data.get("message") or "결제 승인에 실패했습니다."
+        print("NICEPAY APPROVE RESPONSE:", approve_res.status_code, json.dumps(approve_data, ensure_ascii=False))
+
+        approve_result_code = str(approve_data.get("resultCode") or approve_data.get("ResultCode") or "")
+        if approve_res.status_code not in (200, 201) or approve_result_code != "0000":
+            msg = approve_data.get("resultMsg") or approve_data.get("ResultMsg") or approve_data.get("message") or "결제 승인에 실패했습니다."
             conn = get_auth_db()
             conn.execute(
-                "UPDATE payment_orders SET status='FAILED', auth_token=?, raw_approve=?, updated_at=? WHERE order_id=?",
-                (auth_token, json.dumps(approve_data, ensure_ascii=False), utcnow().isoformat(), order_id),
+                """
+                UPDATE payment_orders
+                SET status='FAILED', auth_token=?, tid=?, raw_approve=?, updated_at=?
+                WHERE order_id=?
+                """,
+                (auth_token or approve_key, tid or approve_key, json.dumps(approve_data, ensure_ascii=False), utcnow().isoformat(), order_id),
             )
             conn.commit()
             conn.close()
@@ -1256,8 +1313,8 @@ async def nicepay_return(request: Request):
                 """
             )
 
-        tid = approve_data.get("tid") or approve_data.get("TID") or ""
-        mark_standard_paid(int(order["user_id"]), order_id=order_id, tid=tid, raw_approve=approve_data)
+        approved_tid = approve_data.get("tid") or approve_data.get("TID") or tid or approve_key
+        mark_standard_paid(int(order["user_id"]), order_id=order_id, tid=approved_tid, raw_approve=approve_data)
 
         return HTMLResponse(
             f"""
@@ -1270,10 +1327,17 @@ async def nicepay_return(request: Request):
 
     except Exception as e:
         print("NICEPAY APPROVE ERROR:", repr(e))
+        conn = get_auth_db()
+        conn.execute(
+            "UPDATE payment_orders SET status='ERROR', auth_token=?, tid=?, raw_approve=?, updated_at=? WHERE order_id=?",
+            (auth_token or approve_key, tid or approve_key, json.dumps({"error": repr(e), "return_params": params}, ensure_ascii=False), utcnow().isoformat(), order_id),
+        )
+        conn.commit()
+        conn.close()
         return HTMLResponse(
             f"""
             <script>
-              alert("결제 승인 처리 중 오류가 발생했습니다.");
+              alert("결제 승인 처리 중 오류가 발생했습니다. 관리자에게 문의해주세요.");
               location.href="{FRONTEND_BASE_URL}/#payment";
             </script>
             """
@@ -1472,7 +1536,7 @@ def get_stock(symbol: str, period: str = "1y", user=Depends(get_current_user)):
         daily_change = ((last - prev) / prev) * 100
 
         forecast = ai_momentum_forecast(close_prices)
-        news = safe_news_sentiment(ticker)
+        news = safe_news_sentiment(ticker, symbol=symbol, display_name=display_name)
         auto_signal = automatic_buy_signal(
             rsi=rsi,
             period_change=period_change,
@@ -1504,10 +1568,13 @@ def get_stock(symbol: str, period: str = "1y", user=Depends(get_current_user)):
                 "rsi": round(float(rsi), 1),
                 "signal": auto_signal["label"],
                 "score": auto_signal["score"],
+                "score_max": auto_signal.get("score_max", 10),
                 "forecast_30d": round(float(forecast["forecast_change_pct"]), 2),
                 "forecast_price": round(float(forecast["forecast_price"]), 2),
                 "news_sentiment": news["label"],
                 "news_score": news["score"],
+                "news_score_max": news.get("score_max", 10),
+                "news_count": len(news.get("items", [])),
             },
             "analysis": {
                 "technical": make_technical_text(display_name, rsi, period_change, daily_change),
@@ -2080,91 +2147,304 @@ def ai_momentum_forecast(values):
     }
 
 
-def safe_news_sentiment(ticker):
+def safe_news_sentiment(ticker, symbol: str = "", display_name: str = ""):
     try:
-        return news_sentiment(ticker)
-    except Exception:
-        return {"score": 0, "label": "중립", "items": [], "text": "뉴스 데이터를 가져오지 못했습니다."}
+        return news_sentiment(ticker, symbol=symbol, display_name=display_name)
+    except Exception as e:
+        print("NEWS SENTIMENT ERROR:", repr(e))
+        return {
+            "score": 5,
+            "score_max": 10,
+            "raw_score": 0,
+            "label": "중립",
+            "items": [],
+            "text": "뉴스 데이터를 충분히 가져오지 못해 감성 점수는 중립 5점/10점으로 처리했습니다.",
+        }
 
 
-def news_sentiment(ticker):
-    positive_words = ["beat", "growth", "strong", "surge", "record", "upgrade", "profit", "bullish", "gain", "ai", "demand"]
-    negative_words = ["miss", "fall", "drop", "weak", "downgrade", "loss", "bearish", "risk", "lawsuit", "cut", "slowdown", "concern"]
-
-    try:
-        news_list = ticker.news or []
-    except Exception:
-        news_list = []
-
+def _extract_yfinance_news_items(ticker):
+    """
+    yfinance 버전별 뉴스 구조 차이를 모두 처리합니다.
+    일부 환경에서는 ticker.news의 title이 최상위가 아니라 content 안에 들어옵니다.
+    """
     items = []
-    score = 0
-    for n in news_list[:8]:
-        title = n.get("title", "") or ""
-        publisher = n.get("publisher", "") or ""
-        link = n.get("link", "") or ""
-        published = n.get("providerPublishTime", None)
+    try:
+        raw_news = ticker.news or []
+    except Exception:
+        raw_news = []
+
+    for n in raw_news[:12]:
+        title = ""
+        publisher = ""
+        link = ""
+        published = None
+
+        if isinstance(n, dict):
+            title = n.get("title") or ""
+            publisher = n.get("publisher") or n.get("provider") or ""
+            link = n.get("link") or n.get("url") or ""
+            published = n.get("providerPublishTime") or n.get("pubDate") or n.get("displayTime")
+
+            content = n.get("content")
+            if isinstance(content, dict):
+                title = title or content.get("title") or content.get("headline") or ""
+                provider = content.get("provider")
+                if isinstance(provider, dict):
+                    publisher = publisher or provider.get("displayName") or provider.get("name") or ""
+                elif isinstance(provider, str):
+                    publisher = publisher or provider
+
+                canonical_url = content.get("canonicalUrl")
+                if isinstance(canonical_url, dict):
+                    link = link or canonical_url.get("url") or ""
+                elif isinstance(canonical_url, str):
+                    link = link or canonical_url
+
+                click_through_url = content.get("clickThroughUrl")
+                if not link and isinstance(click_through_url, dict):
+                    link = click_through_url.get("url") or ""
+
+                published = published or content.get("pubDate") or content.get("displayTime")
+
+        if title:
+            date_text = ""
+            try:
+                if isinstance(published, (int, float)):
+                    date_text = datetime.fromtimestamp(published).strftime("%Y-%m-%d")
+                elif isinstance(published, str) and published:
+                    date_text = published[:10]
+            except Exception:
+                date_text = ""
+
+            items.append({
+                "title": title,
+                "publisher": publisher or "Market News",
+                "link": link,
+                "date": date_text,
+            })
+
+    return items
+
+
+def _extract_search_news_items(symbol: str, display_name: str):
+    """
+    ticker.news가 비어 있거나 0점만 나오는 경우를 막기 위해
+    Yahoo Finance Search 뉴스 결과를 보조 뉴스 소스로 사용합니다.
+    """
+    items = []
+    queries = []
+
+    clean_symbol = str(symbol or "").strip()
+    clean_name = str(display_name or "").strip()
+
+    if clean_symbol:
+        queries.append(f"{clean_symbol} stock news earnings outlook")
+    if clean_name and normalize_text(clean_name) != normalize_text(clean_symbol):
+        queries.append(f"{clean_name} stock news earnings outlook")
+    if clean_symbol or clean_name:
+        queries.append(f"{clean_symbol or clean_name} market news")
+
+    seen = set()
+    for q in queries:
+        try:
+            for item in yahoo_market_news_search(q):
+                title = (item.get("title") or "").strip()
+                if not title:
+                    continue
+                key = normalize_text(title)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append({
+                    "title": title,
+                    "publisher": item.get("publisher") or "Yahoo Finance",
+                    "link": item.get("link") or "",
+                    "date": item.get("date") or "",
+                })
+                if len(items) >= 12:
+                    return items
+        except Exception as e:
+            print("SEARCH NEWS ERROR:", repr(e))
+            continue
+
+    return items
+
+
+def news_sentiment(ticker, symbol: str = "", display_name: str = ""):
+    """
+    뉴스 감성 점수:
+    - 0점 ~ 10점 만점
+    - 5점 = 중립
+    - 7점 이상 = 긍정
+    - 3점 이하 = 부정
+    """
+    positive_words = [
+        "beat", "beats", "growth", "strong", "surge", "record", "upgrade", "upgraded",
+        "profit", "profits", "bullish", "gain", "gains", "rally", "outperform", "buy",
+        "raised", "raises", "demand", "ai", "launch", "partnership", "contract",
+        "approval", "expands", "expansion", "tops", "higher", "optimistic", "positive",
+        "accelerate", "breakthrough", "rebound", "jump", "jumps", "soar", "soars"
+    ]
+
+    negative_words = [
+        "miss", "misses", "fall", "falls", "drop", "drops", "weak", "downgrade",
+        "downgraded", "loss", "losses", "bearish", "risk", "lawsuit", "cut", "cuts",
+        "slowdown", "concern", "concerns", "lower", "probe", "investigation",
+        "warning", "slump", "plunge", "decline", "negative", "delay", "recall",
+        "selloff", "sell-off", "down", "fraud", "ban", "tariff"
+    ]
+
+    items = _extract_yfinance_news_items(ticker)
+
+    if len(items) < 3:
+        items = items + _extract_search_news_items(symbol, display_name)
+
+    deduped = []
+    seen = set()
+    for item in items:
+        title = item.get("title", "")
+        key = normalize_text(title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    items = deduped[:12]
+
+    raw_score = 0.0
+    scored_items = []
+
+    for item in items:
+        title = item.get("title", "") or ""
         title_lower = title.lower()
+
+        item_score = 0.0
 
         for w in positive_words:
             if w in title_lower:
-                score += 1
+                item_score += 1.0
         for w in negative_words:
             if w in title_lower:
-                score -= 1
+                item_score -= 1.0
 
-        date_text = ""
-        if published:
-            try:
-                date_text = datetime.fromtimestamp(published).strftime("%Y-%m-%d")
-            except Exception:
-                date_text = ""
-        if title:
-            items.append({"title": title, "publisher": publisher, "link": link, "date": date_text})
+        # 제목에 직접적인 긍정/부정 단어가 없어도 주요 성장/리스크 키워드를 약하게 반영
+        if item_score == 0:
+            if any(x in title_lower for x in ["nvidia", "semiconductor", "cloud", "earnings", "revenue", "data center", "gpu"]):
+                item_score += 0.5
+            if any(x in title_lower for x in ["fed", "rates", "inflation", "tariff", "china", "yield"]):
+                item_score -= 0.5
 
-    label = "긍정" if score >= 2 else "부정" if score <= -2 else "중립"
-    return {"score": score, "label": label, "items": items, "text": f"최근 뉴스 헤드라인 기준 감성 점수는 {score}점이며, 종합 판단은 '{label}'입니다."}
+        raw_score += item_score
+        scored_items.append({**item, "sentiment_score": round(float(item_score), 2)})
+
+    if not items:
+        return {
+            "score": 5,
+            "score_max": 10,
+            "raw_score": 0,
+            "label": "중립",
+            "items": [],
+            "text": "최근 뉴스 데이터가 부족하여 감성 점수는 중립 5점/10점으로 처리했습니다.",
+        }
+
+    normalized = 5 + raw_score
+    normalized = max(0, min(10, round(float(normalized), 1)))
+
+    if normalized >= 7:
+        label = "긍정"
+    elif normalized <= 3:
+        label = "부정"
+    else:
+        label = "중립"
+
+    return {
+        "score": normalized,
+        "score_max": 10,
+        "raw_score": round(float(raw_score), 2),
+        "label": label,
+        "items": scored_items,
+        "text": f"최근 뉴스 헤드라인 {len(items)}건 기준 감성 점수는 {normalized}점/10점 만점이며, 종합 판단은 '{label}'입니다.",
+    }
 
 
 def automatic_buy_signal(rsi, period_change, daily_change, forecast_change, news_score):
-    score = 0
-    if rsi < 35:
-        score += 2
-    elif 35 <= rsi <= 60:
-        score += 1
+    """
+    자동 매수 신호:
+    - 최종 점수는 0점 ~ 10점 만점
+    - 5점 부근 = 관망
+    - 6점 이상 = 매수 관심
+    - 8점 이상 = 강한 매수 관심
+    """
+    raw = 0
+
+    # RSI: 최대 +2 / 최소 -2
+    if rsi < 30:
+        raw += 2
+    elif 30 <= rsi < 45:
+        raw += 1
+    elif 45 <= rsi <= 65:
+        raw += 1
     elif rsi > 75:
-        score -= 2
+        raw -= 2
+    elif rsi > 70:
+        raw -= 1
 
-    if period_change > 8:
-        score += 2
-    elif period_change > 3:
-        score += 1
-    elif period_change < -10:
-        score -= 2
+    # 기간 수익률: 최대 +2 / 최소 -2
+    if period_change > 20:
+        raw += 2
+    elif period_change > 5:
+        raw += 1
+    elif period_change < -20:
+        raw -= 2
+    elif period_change < -8:
+        raw -= 1
 
-    score += 1 if daily_change > 0 else -1
+    # 단기 변동률: 최대 +1 / 최소 -1
+    if daily_change > 0:
+        raw += 1
+    elif daily_change < -3:
+        raw -= 1
 
-    if forecast_change > 5:
-        score += 2
+    # AI 30일 예측: 최대 +2 / 최소 -2
+    if forecast_change > 10:
+        raw += 2
     elif forecast_change > 0:
-        score += 1
-    elif forecast_change < -5:
-        score -= 2
+        raw += 1
+    elif forecast_change < -10:
+        raw -= 2
+    elif forecast_change < 0:
+        raw -= 1
 
-    if news_score >= 2:
-        score += 1
-    elif news_score <= -2:
-        score -= 1
+    # 뉴스 감성: 최대 +2 / 최소 -2
+    ns = float(news_score if news_score is not None else 5)
+    if ns >= 8:
+        raw += 2
+    elif ns >= 6:
+        raw += 1
+    elif ns <= 2:
+        raw -= 2
+    elif ns <= 4:
+        raw -= 1
 
-    if score >= 6:
+    final_score = round(max(0, min(10, 5 + raw * 0.75)), 1)
+
+    if final_score >= 8:
         label = "강한 매수 관심"
-    elif score >= 3:
+    elif final_score >= 6:
         label = "매수 관심"
-    elif score <= -3:
+    elif final_score <= 3:
         label = "매수 보류"
     else:
         label = "관망"
 
-    return {"score": score, "label": label, "text": f"자동 매수 신호 점수는 {score}점입니다. RSI, 기간 수익률, 단기 변동률, AI 30일 예측, 뉴스 감성 점수를 종합하여 '{label}'로 판단했습니다."}
+    return {
+        "score": final_score,
+        "score_max": 10,
+        "raw_score": raw,
+        "label": label,
+        "text": f"자동 매수 신호 점수는 {final_score}점/10점 만점입니다. RSI, 기간 수익률, 단기 변동률, AI 30일 예측, 뉴스 감성 점수를 종합하여 '{label}'로 판단했습니다.",
+    }
+
 
 
 def make_technical_text(name, rsi, period_change, daily_change):
