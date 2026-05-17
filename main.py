@@ -127,6 +127,16 @@ class PasswordFindConfirmRequest(BaseModel):
     verification_code: str
 
 
+class AdminSetStandardRequest(BaseModel):
+    days: Optional[int] = None
+    paid_at: Optional[str] = None
+    reset_free_count: bool = True
+
+
+class AdminSetFreeRequest(BaseModel):
+    reset_free_count: bool = False
+
+
 class NicepayPrepareRequest(BaseModel):
     pass
 
@@ -694,6 +704,15 @@ def verify_admin_secret(x_admin_secret: Optional[str] = Header(None)):
     return True
 
 
+def row_get(row, key, default=None):
+    try:
+        if key in row.keys():
+            return row[key]
+    except Exception:
+        pass
+    return default
+
+
 def admin_public_user(row):
     active = is_standard_active(row)
     return {
@@ -709,6 +728,10 @@ def admin_public_user(row):
         "standard_paid_at": row["standard_paid_at"],
         "ai_analysis_count": int(row["ai_analysis_count"] or 0),
         "free_ai_limit": int(row["free_ai_limit"] or FREE_AI_LIMIT),
+        "last_order_id": row_get(row, "last_order_id"),
+        "last_payment_status": row_get(row, "last_payment_status"),
+        "last_payment_amount": row_get(row, "last_payment_amount"),
+        "last_paid_at": row_get(row, "last_paid_at"),
     }
 
 @app.get("/api/auth/me")
@@ -857,12 +880,16 @@ def admin_users(
         ).fetchone()["cnt"]
         rows = conn.execute(
             """
-            SELECT id, email, terms_accepted, created_at, updated_at,
-                   plan_type, plan_started_at, plan_expire_at, standard_paid_at,
-                   ai_analysis_count, free_ai_limit
-            FROM users
-            WHERE lower(email) LIKE ?
-            ORDER BY id DESC
+            SELECT u.id, u.email, u.terms_accepted, u.created_at, u.updated_at,
+                   u.plan_type, u.plan_started_at, u.plan_expire_at, u.standard_paid_at,
+                   u.ai_analysis_count, u.free_ai_limit,
+                   (SELECT po.order_id FROM payment_orders po WHERE po.user_id=u.id ORDER BY po.id DESC LIMIT 1) AS last_order_id,
+                   (SELECT po.status FROM payment_orders po WHERE po.user_id=u.id ORDER BY po.id DESC LIMIT 1) AS last_payment_status,
+                   (SELECT po.amount FROM payment_orders po WHERE po.user_id=u.id ORDER BY po.id DESC LIMIT 1) AS last_payment_amount,
+                   (SELECT po.updated_at FROM payment_orders po WHERE po.user_id=u.id AND po.status='PAID' ORDER BY po.id DESC LIMIT 1) AS last_paid_at
+            FROM users u
+            WHERE lower(u.email) LIKE ?
+            ORDER BY u.id DESC
             LIMIT ? OFFSET ?
             """,
             (like, limit, offset),
@@ -871,11 +898,15 @@ def admin_users(
         total = conn.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()["cnt"]
         rows = conn.execute(
             """
-            SELECT id, email, terms_accepted, created_at, updated_at,
-                   plan_type, plan_started_at, plan_expire_at, standard_paid_at,
-                   ai_analysis_count, free_ai_limit
-            FROM users
-            ORDER BY id DESC
+            SELECT u.id, u.email, u.terms_accepted, u.created_at, u.updated_at,
+                   u.plan_type, u.plan_started_at, u.plan_expire_at, u.standard_paid_at,
+                   u.ai_analysis_count, u.free_ai_limit,
+                   (SELECT po.order_id FROM payment_orders po WHERE po.user_id=u.id ORDER BY po.id DESC LIMIT 1) AS last_order_id,
+                   (SELECT po.status FROM payment_orders po WHERE po.user_id=u.id ORDER BY po.id DESC LIMIT 1) AS last_payment_status,
+                   (SELECT po.amount FROM payment_orders po WHERE po.user_id=u.id ORDER BY po.id DESC LIMIT 1) AS last_payment_amount,
+                   (SELECT po.updated_at FROM payment_orders po WHERE po.user_id=u.id AND po.status='PAID' ORDER BY po.id DESC LIMIT 1) AS last_paid_at
+            FROM users u
+            ORDER BY u.id DESC
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
@@ -905,6 +936,101 @@ def admin_delete_user(user_id: int, admin_ok=Depends(verify_admin_secret)):
 
     return {"ok": True, "message": "회원 계정이 삭제되었습니다.", "deleted_user_id": user_id, "deleted_email": user["email"]}
 
+
+def parse_admin_paid_at(value: Optional[str]):
+    if not value:
+        return utcnow()
+    text = str(value).strip()
+    if not text:
+        return utcnow()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        raise HTTPException(status_code=400, detail="결제일 형식이 올바르지 않습니다. 예: 2026-05-17T15:30:00")
+
+
+@app.post("/api/admin/users/{user_id}/standard")
+def admin_set_standard_user(user_id: int, req: AdminSetStandardRequest, admin_ok=Depends(verify_admin_secret)):
+    days = int(req.days or STANDARD_PLAN_DAYS)
+    if days < 1 or days > 3660:
+        raise HTTPException(status_code=400, detail="Standard 적용 기간은 1일 이상 3660일 이하로 입력해주세요.")
+
+    paid_at = parse_admin_paid_at(req.paid_at)
+    expire_at = paid_at + timedelta(days=days)
+    now = utcnow().isoformat()
+    manual_order_id = create_order_id(user_id) + "MANUAL"
+    goods_name = f"관리자 수동 Standard {days}일 처리"
+
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="해당 회원을 찾을 수 없습니다.")
+
+    conn.execute(
+        """
+        UPDATE users
+        SET plan_type='STANDARD',
+            plan_started_at=?,
+            plan_expire_at=?,
+            standard_paid_at=?,
+            ai_analysis_count=CASE WHEN ? THEN 0 ELSE ai_analysis_count END,
+            updated_at=?
+        WHERE id=?
+        """,
+        (paid_at.isoformat(), expire_at.isoformat(), paid_at.isoformat(), 1 if req.reset_free_count else 0, now, user_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO payment_orders (order_id, user_id, amount, status, goods_name, raw_prepare, raw_approve, created_at, updated_at)
+        VALUES (?, ?, ?, 'PAID', ?, ?, ?, ?, ?)
+        """,
+        (
+            manual_order_id,
+            user_id,
+            STANDARD_PLAN_AMOUNT,
+            goods_name,
+            json.dumps({"manual_admin": True, "days": days}, ensure_ascii=False),
+            json.dumps({"manual_admin": True, "paid_at": paid_at.isoformat(), "expire_at": expire_at.isoformat()}, ensure_ascii=False),
+            paid_at.isoformat(),
+            now,
+        ),
+    )
+
+    conn.commit()
+    updated = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+
+    return {"ok": True, "message": "Standard 유료회원으로 변경했습니다.", "user": public_user(updated)}
+
+
+@app.post("/api/admin/users/{user_id}/free")
+def admin_set_free_user(user_id: int, req: AdminSetFreeRequest, admin_ok=Depends(verify_admin_secret)):
+    now = utcnow().isoformat()
+    conn = get_auth_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=404, detail="해당 회원을 찾을 수 없습니다.")
+
+    conn.execute(
+        """
+        UPDATE users
+        SET plan_type='FREE',
+            plan_started_at=NULL,
+            plan_expire_at=NULL,
+            standard_paid_at=NULL,
+            ai_analysis_count=CASE WHEN ? THEN 0 ELSE ai_analysis_count END,
+            updated_at=?
+        WHERE id=?
+        """,
+        (1 if req.reset_free_count else 0, now, user_id),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    return {"ok": True, "message": "FREE 회원으로 변경했습니다.", "user": public_user(updated)}
 
 
 # =========================================================
