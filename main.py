@@ -9,7 +9,7 @@ import sqlite3
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import requests
@@ -139,6 +139,14 @@ class AdminSetFreeRequest(BaseModel):
 
 class NicepayPrepareRequest(BaseModel):
     pass
+
+
+class ScreenerRequest(BaseModel):
+    market: str = "ALL"
+    keyword: str = ""
+    limit: int = 40
+    patterns: List[str] = []
+    financials: List[str] = []
 
 
 def validate_runtime_config():
@@ -1342,6 +1350,236 @@ async def nicepay_return(request: Request):
             </script>
             """
         )
+
+
+# =========================================================
+# Standard Stock Screener API
+# =========================================================
+SCREENER_PATTERN_LABELS = {
+    "uptrend_pullback": "상승추세 조정 패턴",
+    "golden_cross": "골든크로스",
+    "breakout": "신고가 돌파",
+    "higher_low": "저점 상승",
+    "bottom_turn": "둥근 바닥",
+    "support_rebound": "지지선 반등",
+    "downtrend": "하락추세 이탈",
+    "v_reversal": "V자 반등",
+}
+
+SCREENER_FINANCIAL_LABELS = {
+    "eps_growth": "주당 순이익 증가",
+    "roe_high": "자기자본이익률 상위",
+    "debt_low": "부채비율 감소",
+    "revenue_growth": "매출 성장",
+    "profit_margin_high": "순이익률 상위",
+    "value_stock": "밸류에이션 저평가",
+    "cashflow_high": "현금흐름 양호",
+    "dividend_high": "배당률 상위",
+    "low_pbr": "저 PBR",
+    "low_per": "저 PER",
+    "sales_growth": "매출액 증가율 상위",
+    "income_growth": "순이익 증가율 상위",
+    "equity_growth": "자기자본 증가율 상위",
+    "turnaround": "흑자 전환",
+}
+
+US_SCREENER_UNIVERSE = [
+    ("Apple", "AAPL"), ("Microsoft", "MSFT"), ("NVIDIA", "NVDA"), ("Tesla", "TSLA"),
+    ("Amazon", "AMZN"), ("Alphabet A", "GOOGL"), ("Meta Platforms", "META"), ("AMD", "AMD"),
+    ("Broadcom", "AVGO"), ("Palantir", "PLTR"), ("Super Micro Computer", "SMCI"), ("TSMC", "TSM"),
+    ("JPMorgan", "JPM"), ("Berkshire Hathaway", "BRK-B"), ("Visa", "V"), ("Eli Lilly", "LLY"),
+    ("Netflix", "NFLX"), ("Costco", "COST"), ("Exxon Mobil", "XOM"), ("Chevron", "CVX"),
+    ("SPDR S&P 500 ETF", "SPY"), ("Invesco QQQ", "QQQ"), ("Technology ETF", "XLK"), ("Semiconductor ETF", "SOXX"),
+]
+
+
+def build_screener_universe(market: str, keyword: str, limit: int):
+    market = (market or "ALL").upper()
+    keyword_norm = normalize_text(keyword or "")
+    result = []
+    seen = set()
+
+    def add_item(name, symbol, item_market):
+        if symbol in seen:
+            return
+        if keyword_norm:
+            hay = normalize_text(f"{name} {symbol} {item_market}")
+            if keyword_norm not in hay:
+                return
+        seen.add(symbol)
+        result.append({"name": name, "symbol": symbol, "market": item_market})
+
+    if market in {"KR", "ALL"}:
+        for name, symbol in KOREAN_NAME_MAP.items():
+            add_item(name, symbol, "Korea")
+        for item in get_krx_stocks():
+            add_item(item.get("name") or item.get("symbol"), item.get("symbol"), item.get("market") or "Korea")
+            if len(result) >= limit and market == "KR":
+                break
+
+    if market in {"US", "ALL"}:
+        for name, symbol in US_SCREENER_UNIVERSE:
+            add_item(name, symbol, "US")
+
+    return result[:max(1, min(int(limit or 40), 120))]
+
+
+def safe_float_value(value, default=None):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str) and not value.strip():
+            return default
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def detect_chart_patterns(close_prices, ma5, ma20, ma60, high_prices, low_prices):
+    patterns = {}
+    if len(close_prices) < 60:
+        return patterns
+    last = float(close_prices[-1])
+    prev = float(close_prices[-2]) if len(close_prices) >= 2 else last
+    recent_high = max([float(x) for x in high_prices[-60:] if not is_bad_number(x)] or [last])
+    recent_low = min([float(x) for x in low_prices[-60:] if not is_bad_number(x)] or [last])
+    ma5_now = safe_float_value(ma5[-1])
+    ma20_now = safe_float_value(ma20[-1])
+    ma60_now = safe_float_value(ma60[-1])
+    ma5_prev = safe_float_value(ma5[-2]) if len(ma5) >= 2 else None
+    ma20_prev = safe_float_value(ma20[-2]) if len(ma20) >= 2 else None
+
+    patterns["golden_cross"] = bool(ma5_prev is not None and ma20_prev is not None and ma5_now is not None and ma20_now is not None and ma5_prev <= ma20_prev and ma5_now > ma20_now)
+    patterns["breakout"] = bool(last >= recent_high * 0.985 and last > prev)
+    patterns["higher_low"] = bool(len(low_prices) >= 40 and min(low_prices[-20:]) > min(low_prices[-40:-20]) * 1.02)
+    patterns["bottom_turn"] = bool(last > min(close_prices[-40:]) * 1.12 and ma20_now is not None and last > ma20_now)
+    patterns["support_rebound"] = bool(recent_low > 0 and last > recent_low * 1.08 and prev <= last)
+    patterns["downtrend"] = bool(ma20_now is not None and ma60_now is not None and last > ma20_now and ma20_now < ma60_now)
+    patterns["v_reversal"] = bool(len(close_prices) >= 25 and min(close_prices[-20:-5]) < close_prices[-25] * 0.9 and last > close_prices[-5] * 1.05)
+    patterns["uptrend_pullback"] = bool(ma20_now is not None and ma60_now is not None and ma20_now > ma60_now and last >= ma20_now * 0.97 and last <= ma20_now * 1.08)
+    return patterns
+
+
+def evaluate_financial_filters(info: dict):
+    pe = safe_float_value(info.get("trailingPE"))
+    pb = safe_float_value(info.get("priceToBook"))
+    roe = safe_float_value(info.get("returnOnEquity"))
+    roa = safe_float_value(info.get("returnOnAssets"))
+    debt = safe_float_value(info.get("debtToEquity"))
+    margin = safe_float_value(info.get("profitMargins"))
+    revenue_growth = safe_float_value(info.get("revenueGrowth"))
+    earnings_growth = safe_float_value(info.get("earningsGrowth"))
+    dividend = safe_float_value(info.get("dividendYield"))
+    operating_cashflow = safe_float_value(info.get("operatingCashflow"))
+    free_cashflow = safe_float_value(info.get("freeCashflow"))
+
+    checks = {
+        "low_per": pe is not None and 0 < pe <= 18,
+        "low_pbr": pb is not None and 0 < pb <= 1.3,
+        "roe_high": roe is not None and roe >= 0.10,
+        "debt_low": debt is not None and debt <= 120,
+        "profit_margin_high": margin is not None and margin >= 0.08,
+        "revenue_growth": revenue_growth is not None and revenue_growth >= 0.05,
+        "sales_growth": revenue_growth is not None and revenue_growth >= 0.08,
+        "income_growth": earnings_growth is not None and earnings_growth >= 0.05,
+        "eps_growth": earnings_growth is not None and earnings_growth >= 0.05,
+        "dividend_high": dividend is not None and dividend >= 0.02,
+        "cashflow_high": (operating_cashflow is not None and operating_cashflow > 0) or (free_cashflow is not None and free_cashflow > 0),
+        "value_stock": (pe is not None and 0 < pe <= 15) or (pb is not None and 0 < pb <= 1.0),
+        "equity_growth": roa is not None and roa >= 0.04,
+        "turnaround": earnings_growth is not None and earnings_growth >= 0.20,
+    }
+    return checks
+
+
+def analyze_screener_symbol(item: dict, selected_patterns: list, selected_financials: list):
+    symbol = item["symbol"]
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(period="1y", interval="1d").dropna()
+    if hist.empty or len(hist) < 60:
+        return None
+
+    close_prices = hist["Close"].astype(float).tolist()
+    high_prices = hist["High"].astype(float).tolist()
+    low_prices = hist["Low"].astype(float).tolist()
+    ma5 = moving_average(close_prices, 5)
+    ma20 = moving_average(close_prices, 20)
+    ma60 = moving_average(close_prices, 60)
+    rsi = calculate_rsi(close_prices)
+    period_return = ((close_prices[-1] - close_prices[0]) / close_prices[0]) * 100
+
+    pattern_checks = detect_chart_patterns(close_prices, ma5, ma20, ma60, high_prices, low_prices)
+    pattern_ok = True if not selected_patterns else any(pattern_checks.get(p) for p in selected_patterns)
+
+    info = {}
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}
+    financial_checks = evaluate_financial_filters(info)
+    financial_ok = True if not selected_financials else all(financial_checks.get(f) for f in selected_financials)
+
+    if not (pattern_ok and financial_ok):
+        return None
+
+    matched_keys = [p for p in selected_patterns if pattern_checks.get(p)] + [f for f in selected_financials if financial_checks.get(f)]
+    matched_labels = [SCREENER_PATTERN_LABELS.get(k) or SCREENER_FINANCIAL_LABELS.get(k) or k for k in matched_keys]
+    currency = "KRW" if symbol.endswith(".KS") or symbol.endswith(".KQ") else "USD"
+    name = item.get("name") or info.get("shortName") or info.get("longName") or symbol
+
+    summary = f"선택 조건 {len(matched_labels)}개 매칭, 1년 수익률 {round(period_return, 2)}%, RSI {round(float(rsi), 1)}"
+    return {
+        "symbol": symbol,
+        "name": name,
+        "market": item.get("market") or ("Korea" if currency == "KRW" else "US"),
+        "currency": currency,
+        "last_price": round(float(close_prices[-1]), 2),
+        "period_return": round(float(period_return), 2),
+        "rsi": round(float(rsi), 1),
+        "matched_labels": matched_labels,
+        "summary": summary,
+    }
+
+
+@app.post("/api/screener")
+def stock_screener(req: ScreenerRequest, user=Depends(get_current_user)):
+    fresh_user = get_user_by_id(user["id"])
+    if not is_standard_active(fresh_user):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "STANDARD_REQUIRED", "message": "Stock Screener는 Standard 회원 전용 기능입니다."},
+        )
+
+    selected_patterns = [p for p in (req.patterns or []) if p in SCREENER_PATTERN_LABELS]
+    selected_financials = [f for f in (req.financials or []) if f in SCREENER_FINANCIAL_LABELS]
+    if not selected_patterns and not selected_financials:
+        raise HTTPException(status_code=400, detail="검색할 필터를 1개 이상 선택해주세요.")
+
+    universe = build_screener_universe(req.market, req.keyword, req.limit)
+    results = []
+    errors = 0
+    for item in universe:
+        try:
+            row = analyze_screener_symbol(item, selected_patterns, selected_financials)
+            if row:
+                results.append(row)
+        except Exception:
+            errors += 1
+            continue
+        if len(results) >= 30:
+            break
+
+    results = sorted(results, key=lambda x: (len(x.get("matched_labels", [])), x.get("period_return", 0)), reverse=True)
+    return {
+        "ok": True,
+        "count": len(results),
+        "checked": len(universe),
+        "errors": errors,
+        "results": results,
+    }
 
 # =========================================================
 # Stock / Market API
